@@ -41,30 +41,19 @@ Create a conda environment and activate it:
   $ conda create -n cellbender python=3.12
   $ conda activate cellbender
 
-Install the `pytables <https://www.pytables.org>`_ module:
+Clone this repository and install CellBender (in editable mode):
 
 .. code-block:: console
 
-  (cellbender) $ conda install -c anaconda pytables
+   (cellbender) [~/] $ git clone https://github.com/broadinstitute/CellBender.git
+   (cellbender) [~/] $ cd CellBender
+   (cellbender) [~/CellBender] $ make install
 
-Install `pytorch <https://pytorch.org>`_ via
-`these instructions <https://pytorch.org/get-started/locally/>`_:
-
-.. code-block:: console
-
-   (cellbender) $ pip install torch
-
-and ensure that your installation is appropriate for your hardware (i.e. that
-the relevant CUDA drivers get installed and that ``torch.cuda.is_available()``
-returns ``True`` if you have a GPU available.
-
-Clone this repository and install CellBender (in editable ``-e`` mode):
+If you prefer not to use the ``make`` command, you can also install CellBender from source via
 
 .. code-block:: console
 
-   (cellbender) $ git clone https://github.com/broadinstitute/CellBender.git
-   (cellbender) $ pip install -e CellBender
-
+   (cellbender) [~/CellBender] $ pip install -e .
 
 Install a specific commit directly from GitHub
 ----------------------------------------------
