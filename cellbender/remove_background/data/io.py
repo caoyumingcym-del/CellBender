@@ -18,6 +18,11 @@ import tables
 
 from cellbender.remove_background import consts
 
+from typing import Any, Dict, Union, List, Optional, Callable
+import logging
+import os
+import gzip
+import traceback
 if TYPE_CHECKING:
     from cellbender.remove_background.posterior import IndexConverter
 

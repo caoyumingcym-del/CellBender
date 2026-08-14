@@ -2,10 +2,13 @@
 
 import argparse
 import logging
+import argparse
+import logging
 import os
 import sys
 import traceback
 from datetime import datetime
+from typing import Any, Dict, Optional, Tuple, Union, cast
 from typing import Any, Dict, Optional, Tuple, Union, cast
 
 import matplotlib
@@ -50,6 +53,7 @@ matplotlib.use("Agg")
 
 
 logger = logging.getLogger("cellbender")
+logger = logging.getLogger("cellbender")
 
 
 def run_remove_background(args: argparse.Namespace) -> Posterior:
@@ -92,7 +96,34 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
         ),
         args=args,
     )[:10]
+        args_to_remove=(
+            [
+                "output_file",
+                "fpr",
+                "input_checkpoint_tarball",
+                "debug",
+                "posterior_batch_size",
+                "checkpoint_min",
+                "truth_file",
+                "posterior_regularization",
+                "cdf_threshold_q",
+                "prq_alpha",
+                "estimator",
+                "use_multiprocessing_estimation",
+                "cpu_threads",
+                # The following settings do not affect the results, and can change when retrying,
+                # so remove them.
+                "epoch_elbo_fail_fraction",
+                "final_elbo_fail_fraction",
+                "num_failed_attempts",
+                "checkpoint_filename",
+            ]
+            + (["epochs"] if args.constant_learning_rate else [])
+        ),
+        args=args,
+    )[:10]
     args.checkpoint_filename = hashcode  # store this in args
+    logger.info(f"(Workflow hash {hashcode})")
     logger.info(f"(Workflow hash {hashcode})")
 
     # Handle initial random state.
@@ -104,6 +135,7 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
 
     # Log the start time.
     logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     logger.info("Running remove-background")
 
     # Run pytorch multithreaded if running on CPU: but this makes little difference in runtime.
@@ -113,6 +145,7 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
         else:
             n_jobs = psutil.cpu_count(logical=True)
         torch.set_num_threads(n_jobs)
+        logger.debug(f"Set pytorch to use {n_jobs} threads")
         logger.debug(f"Set pytorch to use {n_jobs} threads")
 
     # Load data from file and choose barcodes and genes to analyze.
@@ -126,8 +159,14 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
 
     # Instantiate latent variable model and run full inference procedure.
     if args.model == "naive":
+    if args.model == "naive":
         inferred_model = None
     else:
+        inferred_model, _, _, _ = run_inference(
+            dataset_obj=dataset_obj,
+            args=args,
+            output_checkpoint_tarball=args.input_checkpoint_tarball,
+        )
         inferred_model, _, _, _ = run_inference(
             dataset_obj=dataset_obj,
             args=args,
@@ -146,6 +185,7 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
             args=args,
         )
         logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
+        logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
 
         # Save output plots.
         save_output_plots(
@@ -155,9 +195,14 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
             inferred_model=inferred_model,
             p=posterior.latents_map["p"],
             z=posterior.latents_map["z"],
+            p=posterior.latents_map["p"],
+            z=posterior.latents_map["z"],
         )
 
         # Save cell barcodes in a CSV file.
+        analyzed_barcode_logic = posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF
+        assert dataset_obj.data is not None
+        cell_barcodes = dataset_obj.data["barcodes"][dataset_obj.analyzed_barcode_inds[analyzed_barcode_logic]]
         analyzed_barcode_logic = posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF
         assert dataset_obj.data is not None
         cell_barcodes = dataset_obj.data["barcodes"][dataset_obj.analyzed_barcode_inds[analyzed_barcode_logic]]
@@ -173,6 +218,7 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
         )
 
         logger.info("Completed remove-background.")
+        logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
         logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
 
         return posterior
@@ -195,8 +241,17 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
 
         logger.info("Keyboard interrupt.  Terminated without saving.\n")
         sys.exit(1)
+        sys.exit(1)
 
 
+def save_output_plots(
+    file_dir: str,
+    file_name: str,
+    dataset_obj: SingleCellRNACountsDataset,
+    inferred_model: Optional[RemoveBackgroundPyroModel],
+    p: np.ndarray,
+    z: np.ndarray,
+) -> bool:
 def save_output_plots(
     file_dir: str,
     file_name: str,
@@ -216,6 +271,9 @@ def save_output_plots(
         loss = inferred_model.loss if inferred_model is not None else {}
         fig = plot_summary(loss=loss, umi_counts=counts, p=p, z=z)
         fig.savefig(summary_fig_name, bbox_inches="tight", format="pdf")
+        loss = inferred_model.loss if inferred_model is not None else {}
+        fig = plot_summary(loss=loss, umi_counts=counts, p=p, z=z)
+        fig.savefig(summary_fig_name, bbox_inches="tight", format="pdf")
         logger.info(f"Saved summary plots as {summary_fig_name}")
         return True
 
@@ -225,6 +283,9 @@ def save_output_plots(
         return False
 
 
+def compute_output_denoised_counts_reports_metrics(
+    posterior: Posterior, args: argparse.Namespace, file_dir: str, file_name: str
+) -> bool:
 def compute_output_denoised_counts_reports_metrics(
     posterior: Posterior, args: argparse.Namespace, file_dir: str, file_name: str
 ) -> bool:
@@ -253,19 +314,30 @@ def compute_output_denoised_counts_reports_metrics(
     from cellbender.remove_background.estimation import EstimationMethod
 
     estimator: type[EstimationMethod]
+    from cellbender.remove_background.estimation import EstimationMethod
+
+    estimator: type[EstimationMethod]
     noise_target_fun = None
+    if args.estimator == "map":
     if args.estimator == "map":
         estimator = MAP
     elif args.estimator == "mean":
+    elif args.estimator == "mean":
         estimator = Mean
+    elif args.estimator == "sample":
     elif args.estimator == "sample":
         estimator = SingleSample
     elif args.estimator == "cdf":
+    elif args.estimator == "cdf":
         estimator = ThresholdCDF
+    elif args.estimator == "mckp":
     elif args.estimator == "mckp":
         estimator = MultipleChoiceKnapsack
 
         # Prep specific for MCKP: target estimation.
+        logger.info("Computing target noise counts per gene for MCKP estimator")
+        count_matrix = posterior.dataset_obj.data["matrix"]  # all barcodes
+        cell_inds = posterior.dataset_obj.analyzed_barcode_inds[posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF]
         logger.info("Computing target noise counts per gene for MCKP estimator")
         count_matrix = posterior.dataset_obj.data["matrix"]  # all barcodes
         cell_inds = posterior.dataset_obj.analyzed_barcode_inds[posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF]
@@ -285,26 +357,36 @@ def compute_output_denoised_counts_reports_metrics(
             raw_count_csr_for_cells=cell_counts,
             n_cells=len(cell_inds),
             device="cuda" if args.use_cuda else "cpu",  # TODO check this
+            device="cuda" if args.use_cuda else "cpu",  # TODO check this
             per_gene=True,
         )
 
         def noise_target_fun(x):
             return noise_target_fun_per_cell(x) * len(cell_inds)
+
+        def noise_target_fun(x):
+            return noise_target_fun_per_cell(x) * len(cell_inds)
     else:
+        raise ValueError('Input --estimator must be one of ["map", "mean", "sample", "cdf", "mckp"]')
         raise ValueError('Input --estimator must be one of ["map", "mean", "sample", "cdf", "mckp"]')
 
     # Save denoised count matrix outputs (for each FPR if applicable).
     success = True
     for fpr in args.fpr:
         logger.debug(f"Working on FPR {fpr}")
+        logger.debug(f"Working on FPR {fpr}")
 
         # Regularize posterior again at this FPR, if needed.
+        if args.posterior_regularization in ["PRmu", "PRmu_gene"]:
         if args.posterior_regularization in ["PRmu", "PRmu_gene"]:
             # TODO: currently this re-calculates the first FPR which is not necessary
             posterior.regularize_posterior(
                 regularization=PRmu,
                 raw_count_matrix=posterior.dataset_obj.data["matrix"],
+                raw_count_matrix=posterior.dataset_obj.data["matrix"],
                 fpr=fpr,
+                per_gene=True if (args.posterior_regularization == "PRmu_gene") else False,
+                device="cuda",
                 per_gene=True if (args.posterior_regularization == "PRmu_gene") else False,
                 device="cuda",
             )
@@ -318,10 +400,13 @@ def compute_output_denoised_counts_reports_metrics(
             noise_targets = noise_target_fun(fpr).detach().cpu().numpy()
             logger.debug(f"Computed noise targets for FPR {fpr}:\n{noise_targets}")
             logger.info(f"Using MCKP noise targets computed for FPR {fpr}")
+            logger.debug(f"Computed noise targets for FPR {fpr}:\n{noise_targets}")
+            logger.info(f"Using MCKP noise targets computed for FPR {fpr}")
         else:
             noise_targets = None
 
         # Compute denoised counts.
+        logger.info(f"Computing denoised counts using {args.estimator} estimator")
         logger.info(f"Computing denoised counts using {args.estimator} estimator")
         denoised_counts = posterior.compute_denoised_counts(
             estimator_constructor=estimator,
@@ -329,17 +414,21 @@ def compute_output_denoised_counts_reports_metrics(
             q=args.cdf_threshold_q,
             alpha=args.prq_alpha,
             device="cuda" if args.use_cuda else "cpu",
+            device="cuda" if args.use_cuda else "cpu",
             use_multiple_processes=args.use_multiprocessing_estimation,
         )
 
         # Restore eliminated features in cells.
         logger.debug("Restoring eliminated features in cells")
+        logger.debug("Restoring eliminated features in cells")
         denoised_counts = posterior.dataset_obj.restore_eliminated_features_in_cells(
             denoised_counts,
+            posterior.latents_map["p"],
             posterior.latents_map["p"],
         )
 
         # Failsafe to ensure no negative counts.
+        assert np.all(denoised_counts.data >= 0), "Negative count matrix entries in output"
         assert np.all(denoised_counts.data >= 0), "Negative count matrix entries in output"
 
         # TODO: correct cell probabilities so that any zero-count droplet becomes "empty"
@@ -348,8 +437,14 @@ def compute_output_denoised_counts_reports_metrics(
         name_suffix = f"_FPR_{fpr}" if len(args.fpr) > 1 else ""
         fpr_output_filename = os.path.join(file_dir, file_name + name_suffix + ".h5")
         filtered_output_file = os.path.join(file_dir, file_name + name_suffix + "_filtered.h5")
+        name_suffix = f"_FPR_{fpr}" if len(args.fpr) > 1 else ""
+        fpr_output_filename = os.path.join(file_dir, file_name + name_suffix + ".h5")
+        filtered_output_file = os.path.join(file_dir, file_name + name_suffix + "_filtered.h5")
 
         def _writer_helper(file, **kwargs) -> bool:
+            _dataset_obj = posterior.dataset_obj
+            _vi_model = posterior.vi_model
+            assert _dataset_obj is not None and _vi_model is not None
             _dataset_obj = posterior.dataset_obj
             _vi_model = posterior.vi_model
             assert _dataset_obj is not None and _vi_model is not None
@@ -360,7 +455,10 @@ def compute_output_denoised_counts_reports_metrics(
                 posterior_regularization_kwargs=posterior.regularized_posterior_kwargs,
                 estimator=args.estimator,
                 estimator_kwargs=None if (args.cdf_threshold_q is None) else {"q": args.cdf_threshold_q},
+                estimator_kwargs=None if (args.cdf_threshold_q is None) else {"q": args.cdf_threshold_q},
                 latents=posterior.latents_map,
+                dataset_obj=_dataset_obj,
+                learning_curve=_vi_model.loss,
                 dataset_obj=_dataset_obj,
                 learning_curve=_vi_model.loss,
                 fpr=fpr,
@@ -372,6 +470,7 @@ def compute_output_denoised_counts_reports_metrics(
         success = success and write_succeeded
 
         # Count matrix filtered to cells only.
+        analyzed_barcode_logic = posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF
         analyzed_barcode_logic = posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF
         write_succeeded = _writer_helper(
             file=filtered_output_file,
@@ -387,8 +486,12 @@ def compute_output_denoised_counts_reports_metrics(
                 inferred_count_matrix=denoised_counts,
                 fpr=fpr,
                 cell_logic=(posterior.latents_map["p"] >= consts.CELL_PROB_CUTOFF),
+                cell_logic=(posterior.latents_map["p"] >= consts.CELL_PROB_CUTOFF),
                 loss=posterior.vi_model.loss,
             )
+            metrics_file_name = os.path.join(file_dir, file_name + name_suffix + "_metrics.csv")
+            df.to_csv(metrics_file_name, index=True, header=False, float_format="%.3f")
+            logger.info(f"Saved output metrics as {metrics_file_name}")
             metrics_file_name = os.path.join(file_dir, file_name + name_suffix + "_metrics.csv")
             df.to_csv(metrics_file_name, index=True, header=False, float_format="%.3f")
             logger.info(f"Saved output metrics as {metrics_file_name}")
@@ -400,13 +503,19 @@ def compute_output_denoised_counts_reports_metrics(
         try:
             os.environ["INPUT_FILE"] = os.path.abspath(os.path.join(os.getcwd(), args.input_file))
             os.environ["OUTPUT_FILE"] = os.path.abspath(os.path.join(os.getcwd(), fpr_output_filename))
+            os.environ["INPUT_FILE"] = os.path.abspath(os.path.join(os.getcwd(), args.input_file))
+            os.environ["OUTPUT_FILE"] = os.path.abspath(os.path.join(os.getcwd(), fpr_output_filename))
             if args.truth_file is not None:
+                os.environ["TRUTH_FILE"] = os.path.abspath(os.path.join(os.getcwd(), args.truth_file))
+            html_report_file = os.path.join(file_dir, file_name + name_suffix + "_report.html")
                 os.environ["TRUTH_FILE"] = os.path.abspath(os.path.join(os.getcwd(), args.truth_file))
             html_report_file = os.path.join(file_dir, file_name + name_suffix + "_report.html")
             run_notebook_make_html(
                 file=os.path.abspath(os.path.join(os.path.dirname(__file__), "report.ipynb")),
+                file=os.path.abspath(os.path.join(os.path.dirname(__file__), "report.ipynb")),
                 output=html_report_file,
             )
+            logger.info(f"Succeeded in writing report to {html_report_file}")
             logger.info(f"Succeeded in writing report to {html_report_file}")
 
         except Exception:
@@ -430,8 +539,28 @@ def write_denoised_count_matrix(
     analyzed_barcode_logic: Any = ...,
     barcode_inds: Any = ...,
 ) -> bool:
+def write_denoised_count_matrix(
+    file: str,
+    denoised_count_matrix: sp.csr_matrix,
+    posterior_regularization: Optional[str],
+    posterior_regularization_kwargs: Optional[Dict[str, float]],
+    estimator: str,
+    estimator_kwargs: Optional[Dict[str, float]],
+    latents: Dict[str, np.ndarray],
+    dataset_obj: SingleCellRNACountsDataset,
+    learning_curve: Any,  # inferred_model.loss
+    fpr: float,
+    analyzed_barcode_logic: Any = ...,
+    barcode_inds: Any = ...,
+) -> bool:
     """Helper function for writing output h5 files"""
 
+    assert dataset_obj.data is not None
+
+    z = latents["z"][analyzed_barcode_logic, :]
+    d = latents["d"][analyzed_barcode_logic]
+    p = latents["p"][analyzed_barcode_logic]
+    epsilon = latents["epsilon"][analyzed_barcode_logic]
     assert dataset_obj.data is not None
 
     z = latents["z"][analyzed_barcode_logic, :]
@@ -441,15 +570,22 @@ def write_denoised_count_matrix(
 
     # Inferred ambient gene expression vector.
     ambient_expression_trimmed = pyro.param("chi_ambient").detach().cpu().numpy()
+    ambient_expression_trimmed = pyro.param("chi_ambient").detach().cpu().numpy()
 
     # Convert the indices from trimmed gene set to original gene indices.
+    ambient_expression = np.zeros(dataset_obj.data["matrix"].shape[1])
     ambient_expression = np.zeros(dataset_obj.data["matrix"].shape[1])
     ambient_expression[dataset_obj.analyzed_gene_inds] = ambient_expression_trimmed
 
     # Some summary statistics:
     # Fraction of counts in each droplet that were removed.
     raw_count_matrix = dataset_obj.data["matrix"][dataset_obj.analyzed_barcode_inds, :]  # need all genes
+    raw_count_matrix = dataset_obj.data["matrix"][dataset_obj.analyzed_barcode_inds, :]  # need all genes
     raw_counts_droplet = np.array(raw_count_matrix.sum(axis=1)).squeeze()
+    out_counts_droplet = np.array(denoised_count_matrix[dataset_obj.analyzed_barcode_inds, :].sum(axis=1)).squeeze()
+    background_fraction = ((raw_counts_droplet - out_counts_droplet) / (raw_counts_droplet + 0.001))[
+        analyzed_barcode_logic
+    ]
     out_counts_droplet = np.array(denoised_count_matrix[dataset_obj.analyzed_barcode_inds, :].sum(axis=1)).squeeze()
     background_fraction = ((raw_counts_droplet - out_counts_droplet) / (raw_counts_droplet + 0.001))[
         analyzed_barcode_logic
@@ -457,6 +593,13 @@ def write_denoised_count_matrix(
 
     # Handle the optional rho parameters.
     rho = None
+    if ("rho_alpha" in pyro.get_param_store().keys()) and ("rho_beta" in pyro.get_param_store().keys()):
+        rho = np.array(
+            [
+                pyro.param("rho_alpha").detach().cpu().numpy().item(),
+                pyro.param("rho_beta").detach().cpu().numpy().item(),
+            ]
+        )
     if ("rho_alpha" in pyro.get_param_store().keys()) and ("rho_beta" in pyro.get_param_store().keys()):
         rho = np.array(
             [
@@ -477,8 +620,19 @@ def write_denoised_count_matrix(
         "target_false_positive_rate": fpr,
     }
     for k in ["posterior_regularization", "posterior_regularization_kwargs", "estimator", "estimator_kwargs"]:
+    metadata = {
+        "learning_curve": learning_curve,
+        "barcodes_analyzed": dataset_obj.data["barcodes"][dataset_obj.analyzed_barcode_inds],
+        "barcodes_analyzed_inds": dataset_obj.analyzed_barcode_inds,
+        "features_analyzed_inds": dataset_obj.analyzed_gene_inds,
+        "fraction_data_used_for_testing": 1.0 - consts.TRAINING_FRACTION,
+        "target_false_positive_rate": fpr,
+    }
+    for k in ["posterior_regularization", "posterior_regularization_kwargs", "estimator", "estimator_kwargs"]:
         val = locals().get(k)  # give me the input variable with this name
         if val is not None:
+            if not isinstance(val, dict):
+                if not isinstance(val, list):
             if not isinstance(val, dict):
                 if not isinstance(val, list):
                     val = [val]  # wrap in a list, unless it's a dict
@@ -493,7 +647,27 @@ def write_denoised_count_matrix(
         feature_types=dataset_obj.data["feature_types"],
         genomes=dataset_obj.data["genomes"],
         barcodes=dataset_obj.data["barcodes"][barcode_inds],
+        gene_names=dataset_obj.data["gene_names"],
+        gene_ids=dataset_obj.data["gene_ids"],
+        feature_types=dataset_obj.data["feature_types"],
+        genomes=dataset_obj.data["genomes"],
+        barcodes=dataset_obj.data["barcodes"][barcode_inds],
         count_matrix=denoised_count_matrix[barcode_inds, :],
+        local_latents={
+            "barcode_indices_for_latents": dataset_obj.analyzed_barcode_inds,
+            "gene_expression_encoding": z,
+            "cell_size": d,
+            "cell_probability": p,
+            "droplet_efficiency": epsilon,
+            "background_fraction": background_fraction,
+        },
+        global_latents={
+            "ambient_expression": ambient_expression,
+            "empty_droplet_size_lognormal_loc": np.array(pyro.param("d_empty_loc").item()),
+            "empty_droplet_size_lognormal_scale": np.array(pyro.param("d_empty_scale").item()),
+            "cell_size_lognormal_std": np.array(pyro.param("d_cell_scale").item()),
+            "swapping_fraction_dist_params": rho,
+        },
         local_latents={
             "barcode_indices_for_latents": dataset_obj.analyzed_barcode_inds,
             "gene_expression_encoding": z,
@@ -521,11 +695,21 @@ def collect_output_metrics(
     cell_logic,
     loss,
 ) -> pd.DataFrame:
+def collect_output_metrics(
+    dataset_obj: SingleCellRNACountsDataset,
+    inferred_count_matrix: sp.csr_matrix,
+    fpr: Union[float, str],
+    cell_logic,
+    loss,
+) -> pd.DataFrame:
     """Create a table with a few output metrics. The idea is for these to
     potentially be used by people creating automated pipelines."""
 
     assert dataset_obj.data is not None
+    assert dataset_obj.data is not None
     # Compute some metrics
+    input_count_matrix = dataset_obj.data["matrix"][dataset_obj.analyzed_barcode_inds, :]
+    total_raw_counts = dataset_obj.data["matrix"].sum()
     input_count_matrix = dataset_obj.data["matrix"][dataset_obj.analyzed_barcode_inds, :]
     total_raw_counts = dataset_obj.data["matrix"].sum()
     total_output_counts = inferred_count_matrix.sum()
@@ -534,21 +718,35 @@ def collect_output_metrics(
     total_raw_counts_in_nonempty_droplets = input_count_matrix[cell_logic].sum()
     total_counts_removed_from_nonempty_droplets = total_raw_counts_in_nonempty_droplets - inferred_count_matrix.sum()
     fraction_counts_removed_from_nonempty_droplets = (
+    total_counts_removed_from_nonempty_droplets = total_raw_counts_in_nonempty_droplets - inferred_count_matrix.sum()
+    fraction_counts_removed_from_nonempty_droplets = (
         total_counts_removed_from_nonempty_droplets / total_raw_counts_in_nonempty_droplets
+    )
+    average_counts_removed_per_nonempty_droplet = total_counts_removed_from_nonempty_droplets / cell_logic.sum()
+    expected_cells = dataset_obj.priors["expected_cells"]
     )
     average_counts_removed_per_nonempty_droplet = total_counts_removed_from_nonempty_droplets / cell_logic.sum()
     expected_cells = dataset_obj.priors["expected_cells"]
     found_cells = cell_logic.sum()
     average_counts_per_cell = inferred_count_matrix.sum() / found_cells
     ratio_of_found_cells_to_expected_cells = None if (expected_cells is None) else (found_cells / expected_cells)
+    ratio_of_found_cells_to_expected_cells = None if (expected_cells is None) else (found_cells / expected_cells)
     found_empties = len(dataset_obj.analyzed_barcode_inds) - found_cells
+    fraction_of_analyzed_droplets_that_are_nonempty = found_cells / len(dataset_obj.analyzed_barcode_inds)
+    if len(loss["train"]["elbo"]) > 20:
     fraction_of_analyzed_droplets_that_are_nonempty = found_cells / len(dataset_obj.analyzed_barcode_inds)
     if len(loss["train"]["elbo"]) > 20:
         # compare mean ELBO increase over last 3 steps to the typical end(ish) fluctuations
         convergence_indicator = np.mean(
             np.abs([(loss["train"]["elbo"][i] - loss["train"]["elbo"][i - 1]) for i in range(-3, -1)])
         ) / np.std(loss["train"]["elbo"][-20:])
+        convergence_indicator = np.mean(
+            np.abs([(loss["train"]["elbo"][i] - loss["train"]["elbo"][i - 1]) for i in range(-3, -1)])
+        ) / np.std(loss["train"]["elbo"][-20:])
     else:
+        convergence_indicator = "not enough training epochs to compute (requires more than 20)"
+    if len(loss["train"]["elbo"]) > 0:
+        overall_change_in_train_elbo = loss["train"]["elbo"][-1] - loss["train"]["elbo"][0]
         convergence_indicator = "not enough training epochs to compute (requires more than 20)"
     if len(loss["train"]["elbo"]) > 0:
         overall_change_in_train_elbo = loss["train"]["elbo"][-1] - loss["train"]["elbo"][0]
@@ -574,7 +772,27 @@ def collect_output_metrics(
         "convergence_indicator": convergence_indicator,
         "overall_change_in_train_elbo": overall_change_in_train_elbo,
     }
+    all_metrics_dict = {
+        "total_raw_counts": total_raw_counts,
+        "total_output_counts": total_output_counts,
+        "total_counts_removed": total_counts_removed,
+        "fraction_counts_removed": fraction_counts_removed,
+        "total_raw_counts_in_cells": total_raw_counts_in_nonempty_droplets,
+        "total_counts_removed_from_cells": total_counts_removed_from_nonempty_droplets,
+        "fraction_counts_removed_from_cells": fraction_counts_removed_from_nonempty_droplets,
+        "average_counts_removed_per_cell": average_counts_removed_per_nonempty_droplet,
+        "target_fpr": fpr,
+        "expected_cells": expected_cells,
+        "found_cells": found_cells,
+        "output_average_counts_per_cell": average_counts_per_cell,
+        "ratio_of_found_cells_to_expected_cells": ratio_of_found_cells_to_expected_cells,
+        "found_empties": found_empties,
+        "fraction_of_analyzed_droplets_that_are_nonempty": fraction_of_analyzed_droplets_that_are_nonempty,
+        "convergence_indicator": convergence_indicator,
+        "overall_change_in_train_elbo": overall_change_in_train_elbo,
+    }
 
+    return pd.DataFrame(data=all_metrics_dict, index=["metric"]).transpose()
     return pd.DataFrame(data=all_metrics_dict, index=["metric"]).transpose()
 
 
@@ -590,12 +808,14 @@ def write_cell_barcodes_csv(bc_file_name: str, cell_barcodes: np.ndarray):
     # Save barcodes determined to contain cells as _cell_barcodes.csv
     try:
         barcode_names = np.array([str(cell_barcodes[i], encoding="UTF-8") for i in range(cell_barcodes.size)])
+        barcode_names = np.array([str(cell_barcodes[i], encoding="UTF-8") for i in range(cell_barcodes.size)])
     except UnicodeDecodeError:
         # necessary if barcodes are ints
         barcode_names = cell_barcodes
     except TypeError:
         # necessary if barcodes are already decoded
         barcode_names = cell_barcodes
+    np.savetxt(bc_file_name, barcode_names, delimiter=",", fmt="%s")
     np.savetxt(bc_file_name, barcode_names, delimiter=",", fmt="%s")
     logger.info(f"Saved cell barcodes in {bc_file_name}")
 
@@ -608,10 +828,19 @@ def get_optimizer(
     constant_learning_rate: bool,
     total_epochs_for_testing_only: Optional[int] = None,
 ) -> Union[pyro.optim.PyroOptim, pyro.optim.lr_scheduler.PyroLRScheduler]:
+def get_optimizer(
+    n_batches: int,
+    batch_size: int,
+    epochs: int,
+    learning_rate: float,
+    constant_learning_rate: bool,
+    total_epochs_for_testing_only: Optional[int] = None,
+) -> Union[pyro.optim.PyroOptim, pyro.optim.lr_scheduler.PyroLRScheduler]:
     """Get optimizer or learning rate scheduler (if using one)"""
 
     # Set up the optimizer.
     optimizer = pyro.optim.clipped_adam.ClippedAdam  # just ClippedAdam does not work
+    optimizer_args = {"lr": learning_rate, "clip_norm": 10.0}
     optimizer_args = {"lr": learning_rate, "clip_norm": 10.0}
 
     # Set up a learning rate scheduler.
@@ -627,9 +856,21 @@ def get_optimizer(
     }
     OneCycleLR_cls = getattr(pyro.optim, "OneCycleLR")
     scheduler = cast(pyro.optim.PyroOptim, OneCycleLR_cls(scheduler_args))
+    scheduler_args = {
+        "optimizer": optimizer,
+        "max_lr": learning_rate * 10,
+        "total_steps": total_steps,
+        "optim_args": optimizer_args,
+    }
+    OneCycleLR_cls = getattr(pyro.optim, "OneCycleLR")
+    scheduler = cast(pyro.optim.PyroOptim, OneCycleLR_cls(scheduler_args))
 
     # Constant learning rate overrides the above and uses no scheduler.
     if constant_learning_rate:
+        logger.info(
+            "Using ClippedAdam --constant-learning-rate rather than "
+            "the OneCycleLR schedule. This is not usually recommended."
+        )
         logger.info(
             "Using ClippedAdam --constant-learning-rate rather than "
             "the OneCycleLR schedule. This is not usually recommended."
@@ -743,6 +984,8 @@ def run_inference(
             inference run.
 
     """
+
+    assert dataset_obj.data is not None
 
     assert dataset_obj.data is not None
 
@@ -880,7 +1123,9 @@ def run_inference(
 
         if args.model == "simple":
             loss_function: JitTrace_ELBO | JitTraceEnum_ELBO | Trace_ELBO | TraceEnum_ELBO = JitTrace_ELBO()
+            loss_function: JitTrace_ELBO | JitTraceEnum_ELBO | Trace_ELBO | TraceEnum_ELBO = JitTrace_ELBO()
         else:
+            loss_function = JitTraceEnum_ELBO(max_plate_nesting=1, strict_enumeration_warning=False)
             loss_function = JitTraceEnum_ELBO(max_plate_nesting=1, strict_enumeration_warning=False)
     else:
         if args.model == "simple":
@@ -908,10 +1153,33 @@ def run_inference(
             train_loader=train_loader,
             test_loader=test_loader,
         )
+        save_checkpoint(
+            filebase=checkpoint_filename,
+            tarball_name=output_checkpoint_tarball,
+            args=args,
+            model_obj=model,
+            scheduler=svi.optim,
+            train_loader=train_loader,
+            test_loader=test_loader,
+        )
 
     else:
         logger.info("Running inference...")
         try:
+            run_training(
+                model=model,
+                args=args,
+                svi=svi,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                epochs=args.epochs,
+                test_freq=5,
+                output_filename=checkpoint_filename,
+                ckpt_tarball_name=output_checkpoint_tarball,
+                checkpoint_freq=args.checkpoint_min,
+                epoch_elbo_fail_fraction=args.epoch_elbo_fail_fraction,
+                final_elbo_fail_fraction=args.final_elbo_fail_fraction,
+            )
             run_training(
                 model=model,
                 args=args,
@@ -932,21 +1200,31 @@ def run_inference(
 
             # Keep track of number of failed attempts.
             if not hasattr(args, "num_failed_attempts"):
+            if not hasattr(args, "num_failed_attempts"):
                 args.num_failed_attempts = 1
             else:
                 args.num_failed_attempts = args.num_failed_attempts + 1
             logger.debug(f"Training failed, and the number of failed attempts on record is {args.num_failed_attempts}")
+            logger.debug(f"Training failed, and the number of failed attempts on record is {args.num_failed_attempts}")
 
             # Retry training with reduced learning rate, if indicated by user.
+            logger.debug(f"Number of times to retry training is {args.num_training_tries}")
             logger.debug(f"Number of times to retry training is {args.num_training_tries}")
             if args.num_failed_attempts < args.num_training_tries:
                 args.learning_rate = args.learning_rate * args.learning_rate_retry_mult
                 logger.info(
                     f"Restarting training: attempt {args.num_failed_attempts + 1}, learning_rate = {args.learning_rate}"
                 )
+                logger.info(
+                    f"Restarting training: attempt {args.num_failed_attempts + 1}, learning_rate = {args.learning_rate}"
+                )
                 run_remove_background(args)  # start from scratch
                 sys.exit(0)
             else:
+                logger.info(
+                    "No more attempts are specified by --num-training-tries. "
+                    "Therefore the workflow will run once more without ELBO restrictions."
+                )
                 logger.info(
                     "No more attempts are specified by --num-training-tries. "
                     "Therefore the workflow will run once more without ELBO restrictions."

@@ -1,3 +1,5 @@
+"""Tests for checkpointing functions."""
+
 import argparse
 import os
 import random

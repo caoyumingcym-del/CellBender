@@ -7,6 +7,13 @@ import torch.nn as nn
 from cellbender.remove_background import consts
 from cellbender.remove_background.vae.base import FullyConnectedNetwork
 
+import pyro
+import torch
+import torch.nn as nn
+
+from cellbender.remove_background import consts
+from cellbender.remove_background.vae.base import FullyConnectedNetwork
+
 
 class CompositeEncoder(nn.ModuleDict):
     """A composite of several encoders to be run together on the same input.
@@ -27,15 +34,18 @@ class CompositeEncoder(nn.ModuleDict):
     def __init__(self, module_dict):
         super(CompositeEncoder, self).__init__(module_dict)
 
+    def __call__(self, **kwargs):
+        return self.forward(**kwargs)
+
     def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
 
         out = dict()
         # Encode z first.
-        out["z"] = self["z"].forward(**kwargs)
+        out["z"] = self.module_dict["z"].forward(**kwargs)
 
         # For each other module in the dict of the composite encoder,
         # call forward(), and pass in the encoded z.
-        for key, value in self.items():
+        for key, value in self.module_dict.items():
             if key == "z":
                 continue  # already done
 

@@ -325,7 +325,7 @@ def prep_sparse_data_for_training(dataset: sp.csr_matrix,
                                   use_cuda: bool = True) -> Tuple[
                                       "DataLoader",
                                       "DataLoader"]:
-    """Create DataLoaders for train and test sets.
+    """Create torch.utils.data.DataLoaders for train and tests set.
 
     The dataset is kept in memory as a sparse matrix and densified batch-by-batch
     in a background prefetch thread.  Each DataLoader returns CPU tensors (pinned

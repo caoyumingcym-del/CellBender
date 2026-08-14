@@ -164,6 +164,11 @@ class RemoveBackgroundPyroModel(nn.Module):
             # the encoder and decoder networks into GPU memory.
             # CompositeEncoder is an nn.ModuleDict so self.cuda() recurses into it.
             self.cuda()
+            try:
+                for key, value in self.encoder.items():
+                    value.cuda()
+            except KeyError:
+                pass
             self.device = "cuda"
         else:
             self.device = "cpu"
