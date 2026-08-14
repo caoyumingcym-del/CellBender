@@ -12,8 +12,8 @@ have an interesting idea or suggestion, please do not hesitate to reach out to u
 A github issue is often the right place to start a conversation about a new feature
 or a bug fix.
 From there, once we collectively agree on a sense of how to proceed, the repository
-can be forked, changes made (using the ``dev`` branch), and a pull request (PR)
-can be created. PRs are to target the ``dev`` branch.
+can be forked, changes made (using the ``main`` branch), and a pull request (PR)
+can be created. PRs are to target the ``main`` branch.
 
 If you encounter a bug, please file a detailed github
 `issue <https://github.com/broadinstitute/CellBender/issues>`_
