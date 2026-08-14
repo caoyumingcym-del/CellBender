@@ -14,7 +14,7 @@ import shutil
 import tarfile
 import tempfile
 import traceback
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 if TYPE_CHECKING:
     from cellbender.remove_background.model import RemoveBackgroundPyroModel
@@ -699,7 +699,6 @@ def create_workflow_hashcode(
         return ""
 
     return hasher.hexdigest()
-
 
 
 def load_param_store(filename: str, force_device: Optional[str] = None) -> None:

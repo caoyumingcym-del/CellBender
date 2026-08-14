@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 import torch
-from conftest import sparse_matrix_equal
 
 from cellbender.remove_background.estimation import Mean
 from cellbender.remove_background.posterior import (

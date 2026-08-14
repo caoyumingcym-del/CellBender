@@ -7,13 +7,6 @@ import torch.nn as nn
 from cellbender.remove_background import consts
 from cellbender.remove_background.vae.base import FullyConnectedNetwork
 
-import pyro
-import torch
-import torch.nn as nn
-
-from cellbender.remove_background import consts
-from cellbender.remove_background.vae.base import FullyConnectedNetwork
-
 
 class CompositeEncoder(nn.ModuleDict):
     """A composite of several encoders to be run together on the same input.
@@ -41,6 +34,7 @@ class CompositeEncoder(nn.ModuleDict):
 
         out = dict()
         # Encode z first.
+        assert isinstance(self.module_dict, torch.nn.ModuleDict)  # mypy
         out["z"] = self.module_dict["z"].forward(**kwargs)
 
         # For each other module in the dict of the composite encoder,
