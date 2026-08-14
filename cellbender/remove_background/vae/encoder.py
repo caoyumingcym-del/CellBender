@@ -27,19 +27,15 @@ class CompositeEncoder(nn.ModuleDict):
     def __init__(self, module_dict):
         super(CompositeEncoder, self).__init__(module_dict)
 
-    def __call__(self, **kwargs):
-        return self.forward(**kwargs)
-
     def forward(self, **kwargs) -> Dict[str, torch.Tensor]:
 
         out = dict()
         # Encode z first.
-        assert isinstance(self.module_dict, torch.nn.ModuleDict)  # mypy
-        out["z"] = self.module_dict["z"].forward(**kwargs)
+        out["z"] = self["z"].forward(**kwargs)
 
         # For each other module in the dict of the composite encoder,
         # call forward(), and pass in the encoded z.
-        for key, value in self.module_dict.items():
+        for key, value in self.items():
             if key == "z":
                 continue  # already done
 
@@ -124,10 +120,6 @@ class EncodeZ(FullyConnectedNetwork):
         scale = torch.exp(self.sig_out(hidden))
 
         return {"loc": loc.squeeze(), "scale": scale.squeeze()}
-
-
-def _poisson_log_prob(lam, value):
-    return (lam.log() * value) - lam - (value + 1).lgamma()
 
 
 class EncodeNonZLatents(nn.Module):
