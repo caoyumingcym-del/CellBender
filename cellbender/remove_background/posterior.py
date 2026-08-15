@@ -264,8 +264,6 @@ class Posterior:
         self.posterior_batch_size = posterior_batch_size
         self._posterior_parquet_path: Path | None = None
         self._noise_count_posterior_kwargs: dict | None = None
-        # Offsets cached when posterior is loaded via _parquet_to_coo() for regularization.
-        self._noise_count_posterior_coo_offsets: Dict[int, int] | None = None
         self._noise_count_regularized_posterior_coo: sp.coo_matrix | None = None
         self._noise_count_regularized_posterior_kwargs: dict | None = None
         self._latents: Dict[str, np.ndarray] | None = None
@@ -333,7 +331,6 @@ class Posterior:
             logger.debug(self._noise_count_regularized_posterior_kwargs)
             noise_csr = estimator.estimate_noise(
                 noise_log_prob_coo=self._noise_count_regularized_posterior_coo,
-                noise_offsets=self._noise_count_posterior_coo_offsets,
                 **kwargs,
             )
         else:
@@ -342,7 +339,6 @@ class Posterior:
             assert self._posterior_parquet_path is not None
             noise_csr = estimator.estimate_noise(
                 noise_log_prob_coo=self._posterior_parquet_path,
-                noise_offsets=None,  # offsets embedded in parquet
                 **kwargs,
             )
 
@@ -395,18 +391,15 @@ class Posterior:
         # Load the raw posterior COO (bridge for GPU regularization ops).
         self.ensure_posterior_computed()
         assert self._posterior_parquet_path is not None
-        posterior_coo, offsets = _parquet_to_coo(
+        posterior_coo = _parquet_to_coo(
             path=self._posterior_parquet_path,
             index_converter=self.index_converter,
             regularized=False,
         )
-        # Cache offsets for subsequent compute_denoised_counts() calls.
-        self._noise_count_posterior_coo_offsets = offsets
 
         # Compute the regularized posterior.
         self._noise_count_regularized_posterior_coo = regularization.regularize(
             noise_count_posterior_coo=posterior_coo,
-            noise_offsets=offsets,
             index_converter=self.index_converter,
             **kwargs,
         )
@@ -531,8 +524,6 @@ class Posterior:
         else:
             assert self.barcode_inds is not None
             barcode_inds = torch.tensor(self.barcode_inds.copy())
-        nonzero_noise_offset_dict: Dict[int, int] = {}
-
         logger.info("Computing posterior noise count probabilities in mini-batches.")
 
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -573,32 +564,18 @@ class Posterior:
                 bcs_i = dataloader_index_to_analyzed_bc_index[bcs_i]
                 bcs_i = barcode_inds[bcs_i]
 
-                # Per-entry noise offsets.
+                # Per-entry noise offsets (add to compact c to get absolute noise count).
                 offset_i = noise_count_offset_NG[bcs_i_chunk, genes_i_analyzed].detach().cpu()
+                c_i_absolute = (c_i + offset_i).numpy().astype(np.int16)
 
-                # Stream this batch to parquet.
+                # Stream this batch to parquet with absolute c values.
                 write_posterior_batch_to_parquet(
                     writer=writer,
                     cell_ids=bcs_i.numpy().astype(np.int32),
                     gene_ids=genes_i.numpy().astype(np.int32),
-                    c_vals=c_i.numpy().astype(np.int16),
-                    offset_vals=offset_i.numpy().astype(np.int16),
+                    c_vals=c_i_absolute,
                     log_probs=log_prob_i.detach().cpu().numpy().astype(np.float32),
                     regularized=False,
-                )
-
-                # Update offset dict for regularization bridge.
-                nonzero_offset_inds, nonzero_noise_count_offsets = dense_to_sparse_op_torch(
-                    noise_count_offset_NG[bcs_i_chunk, genes_i_analyzed].detach().flatten(),
-                )
-                m_i = self.index_converter.get_m_indices(cell_inds=bcs_i, gene_inds=genes_i)
-                nonzero_noise_offset_dict.update(
-                    dict(
-                        zip(
-                            m_i[nonzero_offset_inds.detach().cpu()].tolist(),
-                            nonzero_noise_count_offsets.detach().cpu().tolist(),
-                        )
-                    )
                 )
 
                 ind += data.shape[0]
@@ -611,8 +588,6 @@ class Posterior:
         # Write global latents JSON sidecar (e.g. phi_loc_scale).
         write_posterior_global_latents_json(_posterior_global_latents_path(path), self.latents_map)
 
-        # Cache offsets for regularization bridge.
-        self._noise_count_posterior_coo_offsets = nonzero_noise_offset_dict
         self._posterior_parquet_path = path
 
     @torch.no_grad()
@@ -1015,9 +990,7 @@ class PosteriorRegularization(ABC):
 
     @staticmethod
     @abstractmethod
-    def regularize(
-        noise_count_posterior_coo: sp.coo_matrix, noise_offsets: Optional[Dict[int, int]], **kwargs
-    ) -> sp.coo_matrix:
+    def regularize(noise_count_posterior_coo: sp.coo_matrix, **kwargs) -> sp.coo_matrix:
         """Perform posterior regularization"""
         pass
 
@@ -1034,8 +1007,8 @@ class PRq(PosteriorRegularization):
         return "PRq"
 
     @staticmethod
-    def _log_mean_plus_alpha_std(log_prob: torch.Tensor, alpha: float):
-        c = torch.arange(log_prob.shape[1]).float().to(log_prob.device).unsqueeze(0)
+    def _log_mean_plus_alpha_std(log_prob: torch.Tensor, alpha: float, col_values: torch.Tensor, **kwargs):
+        c = col_values.unsqueeze(0)
         prob = log_prob.exp()
         mean = (c * prob).sum(dim=-1)
         std = (((c - mean.unsqueeze(-1)).pow(2) * prob).sum(dim=-1)).sqrt()
@@ -1103,7 +1076,6 @@ class PRq(PosteriorRegularization):
     @staticmethod
     def _chunked_compute_regularized_posterior(
         noise_count_posterior_coo: sp.coo_matrix,
-        noise_offsets: Optional[Dict[int, int]],
         log_constraint_violation_fcn: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor],
         log_target_M: torch.Tensor,
         target_tolerance: float = 0.001,
@@ -1116,12 +1088,7 @@ class PRq(PosteriorRegularization):
         # Compute using dense chunks, chunked on m-index.
         if n_chunks is None:
             dense_size_gb = (
-                (
-                    len(np.unique(noise_count_posterior_coo.row))
-                    * (noise_count_posterior_coo.shape[1] + np.array(list((noise_offsets or {}).values())).max())
-                )
-                * 4
-                / 1e9
+                len(np.unique(noise_count_posterior_coo.row)) * noise_count_posterior_coo.shape[1] * 4 / 1e9
             )  # GB
             n_chunks = max(1, int(dense_size_gb // 1))  # approx 1 GB each
 
@@ -1142,18 +1109,15 @@ class PRq(PosteriorRegularization):
             log_pdf_noise_counts_BC = torch.tensor(
                 log_prob_sparse_to_dense(densifiable_csr[(i * chunk_size) : ((i + 1) * chunk_size)])
             ).to(device)
+            # Column positions are absolute noise counts (no per-row offsets).
             noise_count_BC = (
                 torch.arange(log_pdf_noise_counts_BC.shape[1])
-                .to(log_pdf_noise_counts_BC.device)
+                .float()
+                .to(device)
                 .unsqueeze(0)
                 .expand(log_pdf_noise_counts_BC.shape)
             )
             m_indices_for_chunk = unique_rows[(i * chunk_size) : ((i + 1) * chunk_size)]
-            noise_count_BC = noise_count_BC + (
-                torch.tensor([(noise_offsets or {}).get(m, 0) for m in m_indices_for_chunk], dtype=torch.float)
-                .unsqueeze(-1)
-                .to(device)
-            )
 
             # Parallel binary search for beta for each entry of count matrix
             beta_B = torch_binary_search(
@@ -1201,7 +1165,6 @@ class PRq(PosteriorRegularization):
     @torch.no_grad()
     def regularize(
         noise_count_posterior_coo: sp.coo_matrix,
-        noise_offsets: Optional[Dict[int, int]],
         alpha: float = 0.0,
         device: str = "cuda",
         target_tolerance: float = 0.001,
@@ -1212,7 +1175,6 @@ class PRq(PosteriorRegularization):
 
         Args:
             noise_count_posterior_coo: Noise count posterior log prob COO
-            noise_offsets: Offset noise counts per 'm' index
             alpha: The tunable parameter of quantile-targeting posterior
                 regularization. The output distribution has a mean which is
                 input_mean + alpha * input_std (if possible)
@@ -1237,7 +1199,6 @@ class PRq(PosteriorRegularization):
 
         reg_noise_count_posterior_coo = PRq._chunked_compute_regularized_posterior(
             noise_count_posterior_coo=noise_count_posterior_coo,
-            noise_offsets=noise_offsets,
             log_target_M=log_target_M,
             log_constraint_violation_fcn=PRq._get_alpha_log_constraint_violation_given_beta,
             device=device,
@@ -1268,7 +1229,6 @@ class PRmu(PosteriorRegularization):
     @staticmethod
     def _binary_search_for_posterior_regularization_factor(
         noise_count_posterior_coo: sp.coo_matrix,
-        noise_offsets: Optional[Dict[int, int]],
         index_converter: "IndexConverter",
         target_removal: torch.Tensor,
         shape: int,
@@ -1287,7 +1247,6 @@ class PRmu(PosteriorRegularization):
             # Regularize posterior.
             regularized_noise_posterior_coo = PRmu._chunked_compute_regularized_posterior(
                 noise_count_posterior_coo=noise_count_posterior_coo,
-                noise_offsets=noise_offsets,
                 index_converter=index_converter,
                 beta=x,
                 device=device,
@@ -1297,7 +1256,6 @@ class PRmu(PosteriorRegularization):
             estimator = MAP(index_converter=index_converter)
             map_noise_csr = estimator.estimate_noise(
                 noise_log_prob_coo=regularized_noise_posterior_coo,
-                noise_offsets=noise_offsets,
                 device=device,
             )
 
@@ -1328,7 +1286,6 @@ class PRmu(PosteriorRegularization):
     @staticmethod
     def _chunked_compute_regularized_posterior(
         noise_count_posterior_coo: sp.coo_matrix,
-        noise_offsets: Optional[Dict[int, int]],
         index_converter: "IndexConverter",
         beta: torch.Tensor,
         device: str = "cpu",
@@ -1340,12 +1297,7 @@ class PRmu(PosteriorRegularization):
         # Compute using dense chunks, chunked on m-index.
         if n_chunks is None:
             dense_size_gb = (
-                (
-                    len(np.unique(noise_count_posterior_coo.row))
-                    * (noise_count_posterior_coo.shape[1] + np.array(list((noise_offsets or {}).values())).max())
-                )
-                * 4
-                / 1e9
+                len(np.unique(noise_count_posterior_coo.row)) * noise_count_posterior_coo.shape[1] * 4 / 1e9
             )  # GB
             n_chunks = max(1, int(dense_size_gb // 1))  # approx 1 GB each
 
@@ -1366,18 +1318,15 @@ class PRmu(PosteriorRegularization):
             log_pdf_noise_counts_BC = torch.tensor(
                 log_prob_sparse_to_dense(densifiable_csr[(i * chunk_size) : ((i + 1) * chunk_size)])
             ).to(device)
+            # Column positions are absolute noise counts (no per-row offsets).
             noise_count_BC = (
                 torch.arange(log_pdf_noise_counts_BC.shape[1])
-                .to(log_pdf_noise_counts_BC.device)
+                .float()
+                .to(device)
                 .unsqueeze(0)
                 .expand(log_pdf_noise_counts_BC.shape)
             )
             m_indices_for_chunk = unique_rows[(i * chunk_size) : ((i + 1) * chunk_size)]
-            noise_count_BC = noise_count_BC + (
-                torch.tensor([(noise_offsets or {}).get(m, 0) for m in m_indices_for_chunk], dtype=torch.float)
-                .unsqueeze(-1)
-                .to(device)
-            )
 
             # Get beta for this chunk.
             if len(beta) == 1:
@@ -1453,7 +1402,6 @@ class PRmu(PosteriorRegularization):
     @torch.no_grad()
     def regularize(
         noise_count_posterior_coo: sp.coo_matrix,
-        noise_offsets: Optional[Dict[int, int]],
         index_converter: Optional["IndexConverter"] = None,
         raw_count_matrix: Optional[sp.csr_matrix] = None,
         fpr: float = 0.01,
@@ -1468,7 +1416,6 @@ class PRmu(PosteriorRegularization):
 
         Args:
             noise_count_posterior_coo: Noise count posterior log prob COO
-            noise_offsets: Offset noise counts per 'm' index
             index_converter: IndexConverter object from 'm' to (n, g) and back
             raw_count_matrix: The raw count matrix
             fpr: The tunable parameter of mean-targeting posterior
@@ -1508,11 +1455,9 @@ class PRmu(PosteriorRegularization):
         included_cells = set(np.unique(n))
         excluded_barcode_inds = set(range(raw_count_matrix.shape[0])) - included_cells
         raw_count_csr_for_cells = csr_set_rows_to_zero(csr=raw_count_matrix, row_inds=excluded_barcode_inds)
-        # print(raw_count_csr_for_cells)
         logger.debug("Computing target removal")
         target_fun = compute_mean_target_removal_as_function(
             noise_count_posterior_coo=posterior_subset_coo,
-            noise_offsets=noise_offsets,
             index_converter=index_converter,
             raw_count_csr_for_cells=raw_count_csr_for_cells,
             n_cells=len(included_cells),
@@ -1531,7 +1476,6 @@ class PRmu(PosteriorRegularization):
             shape = 1
         beta = PRmu._binary_search_for_posterior_regularization_factor(
             noise_count_posterior_coo=posterior_subset_coo,
-            noise_offsets=noise_offsets,
             index_converter=index_converter,
             target_removal=target_removal,
             device=device,
@@ -1544,7 +1488,6 @@ class PRmu(PosteriorRegularization):
         logger.debug("Computing full regularized posterior")
         regularized_noise_posterior_coo = PRmu._chunked_compute_regularized_posterior(
             noise_count_posterior_coo=noise_count_posterior_coo,
-            noise_offsets=noise_offsets,
             index_converter=index_converter,
             beta=beta,
             device=device,
@@ -1611,7 +1554,6 @@ class IndexConverter:
 
 def compute_mean_target_removal_as_function(
     noise_count_posterior_coo: sp.coo_matrix,
-    noise_offsets: Optional[Dict[int, int]],
     index_converter: IndexConverter,
     raw_count_csr_for_cells: sp.csr_matrix,
     n_cells: int,
@@ -1626,8 +1568,8 @@ def compute_mean_target_removal_as_function(
     multiplying this by the number of cells in question.
 
     Args:
-        noise_count_posterior_coo: Noise count posterior log prob COO
-        noise_offsets: Offset noise counts per 'm' index
+        noise_count_posterior_coo: Noise count posterior log prob COO with
+            absolute noise counts as column indices.
         index_converter: IndexConverter object from 'm' to (n, g) and back
         raw_count_csr_for_cells: The input count matrix for only the cells
             included in the posterior
@@ -1647,7 +1589,6 @@ def compute_mean_target_removal_as_function(
     estimator = Mean(index_converter=index_converter)
     mean_noise_csr = estimator.estimate_noise(
         noise_log_prob_coo=noise_count_posterior_coo,
-        noise_offsets=noise_offsets,
         device=device,
     )
     logger.debug(f"Total counts in raw matrix for cells = {raw_count_csr_for_cells.sum()}")

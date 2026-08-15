@@ -23,7 +23,7 @@ from cellbender.remove_background.posterior import IndexConverter, dense_to_spar
 
 
 @pytest.fixture(scope="module")
-def log_prob_coo_base() -> Dict[str, Union[sp.coo_matrix, np.ndarray, Dict[int, int]]]:
+def log_prob_coo_base() -> Dict[str, Union[sp.coo_matrix, np.ndarray]]:
     n = -np.inf
     m = np.array(
         [
@@ -43,24 +43,31 @@ def log_prob_coo_base() -> Dict[str, Union[sp.coo_matrix, np.ndarray, Dict[int, 
     rows = rows + 1
     shape = list(m.shape)
     shape[0] = shape[0] + 1
-    offset_dict = dict(zip(range(1, 9), [0] * 7 + [1]))  # noise count offsets (last is 1)
 
+    # The last dense row (m row 7, COO row 8) has a noise count offset of 1 in the old
+    # representation. We encode that offset directly into the COO column values (absolute
+    # noise counts), shifting cols for that row by +1.
+    last_row_mask = (rows == 8).numpy()
+    cols = cols.clone()
+    cols[last_row_mask] = cols[last_row_mask] + 1
+
+    # Absolute MAP and CDF values (offset already embedded in COO cols above).
     maps = np.argmax(m, axis=1)
-    maps = maps + np.array([offset_dict[m] for m in offset_dict.keys()])
+    shifts = np.array([0] * 7 + [1])
+    maps = maps + shifts
     cdf_logic = torch.logcumsumexp(torch.tensor(m), dim=-1) > np.log(0.5)
     cdfs_list = [np.where(a)[0][0] for a in cdf_logic]
-    cdfs: np.ndarray = cdfs_list + np.array([offset_dict[m] for m in offset_dict.keys()])
+    cdfs: np.ndarray = np.array(cdfs_list) + shifts
 
     return {
         "coo": sp.coo_matrix((vals, (rows, cols)), shape=shape),
-        "offsets": offset_dict,  # not all noise counts start at zero
         "maps": np.array([0] + maps.tolist()),
         "cdfs": np.array([0] + cdfs.tolist()),
     }
 
 
 @pytest.fixture(scope="module", params=["exact", "filtered", "unsorted"])
-def log_prob_coo(request, log_prob_coo_base) -> Dict[str, Union[sp.coo_matrix, np.ndarray, Dict[int, int]]]:
+def log_prob_coo(request, log_prob_coo_base) -> Dict[str, Union[sp.coo_matrix, np.ndarray]]:
     """When used as an input argument, this offers up a series of dicts that
     can be used for tests"""
     if request.param == "exact":
@@ -100,18 +107,16 @@ def test_mean_massive_m(log_prob_coo):
     print(f"new COO shape: {new_coo.shape}")
     print(f"new row minimum value: {new_coo.row.min()}")
     print(f"new row maximum value: {new_coo.row.max()}")
-    offset_dict = {k + greater_than_max_int32: v for k, v in log_prob_coo["offsets"].items()}
-
     # this is just a shim
     converter = IndexConverter(total_n_cells=new_coo.shape[0], total_n_genes=new_coo.shape[1])
 
     # set up and estimate
     estimator = Mean(index_converter=converter)
-    _noise_csr = estimator.estimate_noise(noise_log_prob_coo=new_coo, noise_offsets=offset_dict)
+    _noise_csr = estimator.estimate_noise(noise_log_prob_coo=new_coo)
 
 
 @pytest.fixture(scope="module", params=["exact", "filtered", "unsorted"])
-def mckp_log_prob_coo(request, log_prob_coo_base) -> Dict[str, Union[sp.coo_matrix, np.ndarray, Dict[int, int]]]:
+def mckp_log_prob_coo(request, log_prob_coo_base) -> Dict[str, Union[sp.coo_matrix, np.ndarray]]:
     """When used as an input argument, this offers up a series of dicts that
     can be used for tests.
 
@@ -120,9 +125,7 @@ def mckp_log_prob_coo(request, log_prob_coo_base) -> Dict[str, Union[sp.coo_matr
     """
 
     def _fix(v):
-        if isinstance(v, dict):
-            return {(k - 1): val for k, val in v.items()}
-        elif isinstance(v, sp.coo_matrix):
+        if isinstance(v, sp.coo_matrix):
             return _eliminate_row_zero(v)
         else:
             return v
@@ -170,31 +173,31 @@ def test_single_sample(log_prob_coo):
 
     # set up and estimate
     estimator = SingleSample(index_converter=converter)
-    noise_csr = estimator.estimate_noise(noise_log_prob_coo=log_prob_coo["coo"], noise_offsets=log_prob_coo["offsets"])
+    noise_csr = estimator.estimate_noise(noise_log_prob_coo=log_prob_coo["coo"])
 
     # output
     print("dense noise count estimate, per m")
     out_per_m = np.array(noise_csr.todense()).squeeze()
     print(out_per_m)
 
-    # test
-    for i in log_prob_coo["offsets"].keys():
+    # test: allowed values are the nonzero column indices in the dense representation
+    # (which already encode absolute noise counts since offsets were removed)
+    dense = log_prob_sparse_to_dense(log_prob_coo["coo"])
+    for i in range(1, log_prob_coo["coo"].shape[0]):
+        row = dense[i, :]
+        if not np.any(row > -np.inf):
+            continue  # empty row
         print(f'testing "m" value {i}')
-        allowed_vals = np.arange(dense.shape[1])[dense[i, :] > -np.inf] + log_prob_coo["offsets"][i]
+        allowed_vals = np.arange(dense.shape[1])[row > -np.inf]
         print("allowed values")
         print(allowed_vals)
         print("sample")
         print(out_per_m[i])
-        assert out_per_m[i] in allowed_vals, f"sample {out_per_m[i]} is not allowed for {dense[i, :]}"
+        assert out_per_m[i] in allowed_vals, f"sample {out_per_m[i]} is not allowed for {row}"
 
 
 def test_mean(log_prob_coo):
     """Test the mean estimator"""
-
-    def _add_offsets_to_truth(truth: np.ndarray, offset_dict: Dict[int, int]):
-        return truth + np.array([offset_dict.get(m, 0) for m in range(len(truth))])
-
-    offset_dict = log_prob_coo["offsets"]
 
     # the input
     print(log_prob_coo)
@@ -207,16 +210,15 @@ def test_mean(log_prob_coo):
 
     # set up and estimate
     estimator = Mean(index_converter=converter)
-    noise_csr = estimator.estimate_noise(noise_log_prob_coo=log_prob_coo["coo"], noise_offsets=offset_dict)
+    noise_csr = estimator.estimate_noise(noise_log_prob_coo=log_prob_coo["coo"])
 
     # output
     print("dense noise count estimate, per m")
     out_per_m = np.array(noise_csr.todense()).squeeze()
     print(out_per_m)
 
-    # truth
+    # truth: column positions in the dense matrix ARE the absolute noise counts
     brute_force = np.matmul(np.arange(dense.shape[1]), np.exp(dense).transpose())
-    brute_force = _add_offsets_to_truth(truth=brute_force, offset_dict=offset_dict)
     print("truth")
     print(brute_force)
 
@@ -226,8 +228,6 @@ def test_mean(log_prob_coo):
 
 def test_map(log_prob_coo):
     """Test the MAP estimator"""
-
-    offset_dict = log_prob_coo["offsets"]
 
     # the input
     print(log_prob_coo)
@@ -239,7 +239,7 @@ def test_map(log_prob_coo):
 
     # set up and estimate
     estimator = MAP(index_converter=converter)
-    noise_csr = estimator.estimate_noise(noise_log_prob_coo=log_prob_coo["coo"], noise_offsets=offset_dict)
+    noise_csr = estimator.estimate_noise(noise_log_prob_coo=log_prob_coo["coo"])
 
     # output
     print("dense noise count estimate, per m")
@@ -255,8 +255,6 @@ def test_map(log_prob_coo):
 def test_cdf(log_prob_coo):
     """Test the estimator based on CDF thresholding"""
 
-    offset_dict = log_prob_coo["offsets"]
-
     # the input
     print(log_prob_coo)
     print("input log probs")
@@ -267,7 +265,7 @@ def test_cdf(log_prob_coo):
 
     # set up and estimate
     estimator = ThresholdCDF(index_converter=converter)
-    noise_csr = estimator.estimate_noise(noise_log_prob_coo=log_prob_coo["coo"], noise_offsets=offset_dict, q=0.5)
+    noise_csr = estimator.estimate_noise(noise_log_prob_coo=log_prob_coo["coo"], q=0.5)
 
     # output
     print("dense noise count estimate, per m")
@@ -307,8 +305,6 @@ def test_cdf(log_prob_coo):
 def test_mckp(mckp_log_prob_coo, n_cells, target, truth, truth_mat, n_chunks, parallel_compute):
     """Test the multiple choice knapsack problem estimator"""
 
-    offset_dict = mckp_log_prob_coo["offsets"]
-
     # the input
     print("input log probs ===============================================")
     print(log_prob_sparse_to_dense(mckp_log_prob_coo["coo"]))
@@ -318,7 +314,6 @@ def test_mckp(mckp_log_prob_coo, n_cells, target, truth, truth_mat, n_chunks, pa
     estimator = MultipleChoiceKnapsack(index_converter=converter)
     noise_csr = estimator.estimate_noise(
         noise_log_prob_coo=mckp_log_prob_coo["coo"],
-        noise_offsets=offset_dict,
         noise_targets_per_gene=target,
         verbose=True,
         n_chunks=n_chunks,
@@ -388,17 +383,12 @@ def test_estimation_array_to_csr():
     converter = IndexConverter(total_n_cells=larger_than_uint16, total_n_genes=larger_than_uint16)
     m = larger_than_uint16 + np.arange(-10, 10)
     data = np.random.rand(len(m)) * -10
-    noise_offsets = None
 
-    output_csr = _estimation_array_to_csr(
-        index_converter=converter, data=data, m=m, noise_offsets=noise_offsets, dtype=COUNT_DATATYPE
-    )
+    output_csr = _estimation_array_to_csr(index_converter=converter, data=data, m=m, dtype=COUNT_DATATYPE)
 
     # reimplementation here with totally permissive datatypes
     cell_and_gene_dtype = np.float64
     row, col = converter.get_ng_indices(m_inds=m)
-    if noise_offsets is not None:
-        data = data + np.array([noise_offsets.get(i, 0) for i in m])
     coo = sp.coo_matrix(
         (data.astype(COUNT_DATATYPE), (row.astype(cell_and_gene_dtype), col.astype(cell_and_gene_dtype))),
         shape=converter.matrix_shape,

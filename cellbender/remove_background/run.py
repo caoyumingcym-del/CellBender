@@ -273,14 +273,13 @@ def compute_output_denoised_counts_reports_metrics(
         cell_counts = csr_set_rows_to_zero(csr=count_matrix, row_inds=empty_inds)
 
         assert posterior.posterior_path is not None, "Posterior must be computed before MCKP target estimation."
-        _mckp_coo, _mckp_offsets = _parquet_to_coo(
+        _mckp_coo = _parquet_to_coo(
             path=posterior.posterior_path,
             index_converter=posterior.index_converter,
             regularized=False,
         )
         noise_target_fun_per_cell = compute_mean_target_removal_as_function(
             noise_count_posterior_coo=_mckp_coo,
-            noise_offsets=_mckp_offsets,
             index_converter=posterior.index_converter,
             raw_count_csr_for_cells=cell_counts,
             n_cells=len(cell_inds),

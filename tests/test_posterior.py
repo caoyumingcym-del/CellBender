@@ -28,7 +28,7 @@ USE_CUDA = torch.cuda.is_available()
 
 
 @pytest.fixture(scope="module")
-def log_prob_coo_base() -> Dict[str, Union[sp.coo_matrix, np.ndarray, Dict[int, int]]]:
+def log_prob_coo_base() -> Dict[str, Union[sp.coo_matrix, np.ndarray]]:
     n = -np.inf
     m = np.array(
         [
@@ -44,12 +44,13 @@ def log_prob_coo_base() -> Dict[str, Union[sp.coo_matrix, np.ndarray, Dict[int, 
     rows = rows + 1
     shape = list(m.shape)
     shape[0] = shape[0] + 1
-    offset_dict = dict(zip(range(1, len(m) + 1), [0] * len(m) + [1]))  # noise count offsets (last is 1)
-    return {"coo": sp.coo_matrix((vals, (rows, cols)), shape=shape), "offsets": offset_dict}
+    # All rows have zero offset in the original test (zip truncates, so [0]*4 entries only).
+    # COO col values are already absolute noise counts.
+    return {"coo": sp.coo_matrix((vals, (rows, cols)), shape=shape)}
 
 
 @pytest.fixture(scope="module", params=["sorted", "unsorted"])
-def log_prob_coo(request, log_prob_coo_base) -> Dict[str, Union[sp.coo_matrix, np.ndarray, Dict[int, int]]]:
+def log_prob_coo(request, log_prob_coo_base) -> Dict[str, Union[sp.coo_matrix, np.ndarray]]:
     """When used as an input argument, this offers up a series of dicts that
     can be used for tests"""
     if request.param == "sorted":
@@ -115,7 +116,6 @@ def test_PRq(log_prob_coo, alpha, n_chunks, cuda):
     print("means after regularization")
     regularized_coo = PRq.regularize(
         noise_count_posterior_coo=log_prob_coo["coo"],
-        noise_offsets=log_prob_coo["offsets"],
         alpha=alpha,
         device="cuda" if cuda else "cpu",
         target_tolerance=target_tolerance,
@@ -166,7 +166,6 @@ def test_PRmu(log_prob_coo, fpr, per_gene, n_chunks, cuda):
     estimator = Mean(index_converter=index_converter)
     mean_noise_csr = estimator.estimate_noise(
         noise_log_prob_coo=log_prob_coo["coo"],
-        noise_offsets=log_prob_coo["offsets"],
         device="cuda" if cuda else "cpu",
     )
     print(f"Mean estimator removes {mean_noise_csr.sum()} counts total")
@@ -175,7 +174,6 @@ def test_PRmu(log_prob_coo, fpr, per_gene, n_chunks, cuda):
     n_cells = 4  # hard coded from the log_prob_coo
     target_fun = compute_mean_target_removal_as_function(
         noise_count_posterior_coo=log_prob_coo["coo"],
-        noise_offsets=log_prob_coo["offsets"],
         raw_count_csr_for_cells=count_matrix,
         n_cells=n_cells,
         index_converter=index_converter,
@@ -189,7 +187,6 @@ def test_PRmu(log_prob_coo, fpr, per_gene, n_chunks, cuda):
     print("means after regularization")
     regularized_coo = PRmu.regularize(
         noise_count_posterior_coo=log_prob_coo["coo"],
-        noise_offsets=log_prob_coo["offsets"],
         index_converter=index_converter,
         raw_count_matrix=count_matrix,
         fpr=fpr,
@@ -324,7 +321,6 @@ def test_compute_mean_target_removal_as_function(log_prob_coo, fpr, per_gene, cu
     """The target removal computation, very important for the MCKP output"""
 
     noise_count_posterior_coo = log_prob_coo["coo"]
-    noise_offsets = log_prob_coo["offsets"]
     device = "cuda" if cuda else "cpu"
 
     print("log prob posterior coo")
@@ -343,7 +339,6 @@ def test_compute_mean_target_removal_as_function(log_prob_coo, fpr, per_gene, cu
 
     target_fun = compute_mean_target_removal_as_function(
         noise_count_posterior_coo=noise_count_posterior_coo,
-        noise_offsets=noise_offsets,
         index_converter=index_converter,
         raw_count_csr_for_cells=count_matrix,
         n_cells=n_cells,
@@ -362,9 +357,8 @@ def test_compute_mean_target_removal_as_function(log_prob_coo, fpr, per_gene, cu
     # TODO: this has not been tested out
 
 
-@pytest.mark.parametrize("blank_noise_offsets", [False, True], ids=["", "no_noise_offsets"])
 @pytest.mark.parametrize("m", [1000, 2200000000], ids=["small", "big"])
-def test_save_and_load(tmpdir_factory, blank_noise_offsets, m):
+def test_save_and_load(tmpdir_factory, m):
     """Test that a round trip through save and load gives the same thing"""
     from pathlib import Path
 
@@ -387,9 +381,6 @@ def test_save_and_load(tmpdir_factory, blank_noise_offsets, m):
     cell_ids = np.random.randint(0, 100, size=num_nonzeros, dtype=np.int32)
     gene_ids = np.random.randint(0, 50, size=num_nonzeros, dtype=np.int32)
     c_vals = np.random.randint(0, 10, size=num_nonzeros, dtype=np.int16)
-    offset_vals = np.zeros(num_nonzeros, dtype=np.int16)
-    if not blank_noise_offsets:
-        offset_vals[:5] = 1
     log_probs = np.random.rand(num_nonzeros).astype(np.float32) * -10
 
     with pq.ParquetWriter(src_file, schema=POSTERIOR_SCHEMA) as writer:
@@ -398,7 +389,6 @@ def test_save_and_load(tmpdir_factory, blank_noise_offsets, m):
             cell_ids=cell_ids,
             gene_ids=gene_ids,
             c_vals=c_vals,
-            offset_vals=offset_vals,
             log_probs=log_probs,
             regularized=False,
         )

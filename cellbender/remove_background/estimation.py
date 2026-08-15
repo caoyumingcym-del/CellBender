@@ -44,30 +44,25 @@ class EstimationMethod(ABC):
         super(EstimationMethod, self).__init__()
 
     @abstractmethod
-    def estimate_noise(
-        self, noise_log_prob_coo: sp.coo_matrix, noise_offsets: Optional[Dict[int, int]], **kwargs
-    ) -> sp.csr_matrix:
+    def estimate_noise(self, noise_log_prob_coo: sp.coo_matrix, **kwargs) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts.
         Args:
             noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix
-            noise_offsets: Noise count offset values keyed by 'm'.
+                values in a (m, c) COO matrix where col values are absolute
+                noise counts.
         """
         pass
 
-    def _estimation_array_to_csr(
-        self, data: np.ndarray, m: np.ndarray, noise_offsets: Optional[Dict[int, int]], dtype=COUNT_DATATYPE
-    ) -> sp.csr_matrix:
+    def _estimation_array_to_csr(self, data: np.ndarray, m: np.ndarray, dtype=COUNT_DATATYPE) -> sp.csr_matrix:
         """Say you have point estimates for each count matrix element (data) and
         you have the 'm'-indices for each value (m). This returns a CSR matrix
         that has the shape of the count matrix, where duplicate entries have
         been summed.
 
         Args:
-            data: Point estimates for each nonzero entry of the count matrix, in
-                a flat format, indexed by 'm'.
+            data: Point estimates (absolute noise counts) for each nonzero entry
+                of the count matrix, in a flat format, indexed by 'm'.
             m: Array of the same length as data, where each entry is an m-index.
-            noise_offsets: Noise count offset values keyed by 'm'.
             dtype: Data type for sparse matrix. Int32 is too small for 'm' indices.
 
         Results:
@@ -78,32 +73,22 @@ class EstimationMethod(ABC):
             index_converter=self.index_converter,
             data=data,
             m=m,
-            noise_offsets=noise_offsets,
             dtype=dtype,
         )
-        # row, col = self.index_converter.get_ng_indices(m_inds=m)
-        # if noise_offsets is not None:
-        #     data = data + np.array([noise_offsets[i] for i in m])
-        # coo = sp.coo_matrix((data.astype(dtype), (row.astype(dtype), col.astype(dtype))),
-        #                     shape=self.index_converter.matrix_shape, dtype=dtype)
-        # coo.sum_duplicates()
-        # return coo.tocsr()
 
 
 class SingleSample(EstimationMethod):
     """A single sample from the noise count posterior"""
 
     @torch.no_grad()
-    def estimate_noise(
-        self, noise_log_prob_coo: sp.coo_matrix, noise_offsets: Optional[Dict[int, int]], device: str = "cpu", **kwargs
-    ) -> sp.csr_matrix:
+    def estimate_noise(self, noise_log_prob_coo: sp.coo_matrix, device: str = "cpu", **kwargs) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts by
         taking a single sample from each probability distribution.
 
         Args:
             noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix
-            noise_offsets: Noise count offset values keyed by 'm'.
+                values in a (m, c) COO matrix where col values are absolute
+                noise counts.
             device: ['cpu', 'cuda'] - whether to perform the pytorch sampling
                 operation on CPU or GPU. It's pretty fast on CPU already.
 
@@ -111,59 +96,51 @@ class SingleSample(EstimationMethod):
             noise_count_csr: Estimated noise count matrix.
         """
 
-        def _torch_sample(x):
-            return Categorical(logits=x, validate_args=False).sample()
+        def _torch_sample(x, col_values, **kw):
+            return col_values[Categorical(logits=x, validate_args=False).sample().long()]
 
         result = apply_function_dense_chunks(noise_log_prob_coo=noise_log_prob_coo, fun=_torch_sample, device=device)
-        return self._estimation_array_to_csr(data=result["result"], m=result["m"], noise_offsets=noise_offsets)
+        return self._estimation_array_to_csr(data=result["result"], m=result["m"])
 
 
 class Mean(EstimationMethod):
     """Posterior mean"""
 
-    def estimate_noise(
-        self, noise_log_prob_coo: sp.coo_matrix, noise_offsets: Optional[Dict[int, int]], device: str = "cpu", **kwargs
-    ) -> sp.csr_matrix:
+    def estimate_noise(self, noise_log_prob_coo: sp.coo_matrix, device: str = "cpu", **kwargs) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts by
         taking the mean of each probability distribution.
 
         Args:
             noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix
-            noise_offsets: Noise count offset values keyed by 'm'.
+                values in a (m, c) COO matrix where col values are absolute
+                noise counts.
 
         Returns:
             noise_count_csr: Estimated noise count matrix.
         """
-        # c = torch.arange(noise_log_prob_coo.shape[1], dtype=float).to(device).t()
 
-        def _torch_mean(x):
-            c = torch.arange(x.shape[1], dtype=float).to(x.device)
-            return torch.matmul(x.exp(), c.t())
+        def _torch_mean(x, col_values, **kw):
+            return torch.matmul(x.exp(), col_values)
 
         result = apply_function_dense_chunks(noise_log_prob_coo=noise_log_prob_coo, fun=_torch_mean, device=device)
-        return self._estimation_array_to_csr(
-            data=result["result"], m=result["m"], noise_offsets=noise_offsets, dtype=np.float32
-        )
+        return self._estimation_array_to_csr(data=result["result"], m=result["m"], dtype=np.float32)
 
 
 class MAP(EstimationMethod):
     """The canonical maximum a posteriori"""
 
     @staticmethod
-    def torch_argmax(x):
-        return x.argmax(dim=-1)
+    def torch_argmax(x, col_values, **kwargs):
+        return col_values[x.argmax(dim=-1).long()]
 
-    def estimate_noise(
-        self, noise_log_prob_coo: sp.coo_matrix, noise_offsets: Optional[Dict[int, int]], device: str = "cpu", **kwargs
-    ) -> sp.csr_matrix:
+    def estimate_noise(self, noise_log_prob_coo: sp.coo_matrix, device: str = "cpu", **kwargs) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts by
         taking the maximum a posteriori (MAP) of each probability distribution.
 
         Args:
             noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix
-            noise_offsets: Noise count offset values keyed by 'm'.
+                values in a (m, c) COO matrix where col values are absolute
+                noise counts.
             device: ['cpu', 'cuda'] - whether to perform the pytorch argmax
                 operation on CPU or GPU. It's pretty fast on CPU already.
 
@@ -173,20 +150,20 @@ class MAP(EstimationMethod):
         result = apply_function_dense_chunks(
             noise_log_prob_coo=noise_log_prob_coo, fun=self.torch_argmax, device=device
         )
-        return self._estimation_array_to_csr(data=result["result"], m=result["m"], noise_offsets=noise_offsets)
+        return self._estimation_array_to_csr(data=result["result"], m=result["m"])
 
 
 class ThresholdCDF(EstimationMethod):
     """Noise estimation via thresholding the noise count CDF"""
 
     @staticmethod
-    def torch_cdf_fun(x: torch.Tensor, q: float):
-        return (x.exp().cumsum(dim=-1) <= q).sum(dim=-1)
+    def torch_cdf_fun(x: torch.Tensor, q: float, col_values: torch.Tensor, **kwargs):
+        compact_idx = (x.exp().cumsum(dim=-1) <= q).sum(dim=-1).long()
+        return col_values[compact_idx.clamp(max=len(col_values) - 1)]
 
     def estimate_noise(
         self,
         noise_log_prob_coo: sp.coo_matrix,
-        noise_offsets: Optional[Dict[int, int]],
         q: float = 0.5,
         device: str = "cpu",
         **kwargs,
@@ -195,8 +172,8 @@ class ThresholdCDF(EstimationMethod):
 
         Args:
             noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix
-            noise_offsets: Noise count offset values keyed by 'm'.
+                values in a (m, c) COO matrix where col values are absolute
+                noise counts.
             q: The CDF threshold value.
 
         Returns:
@@ -205,22 +182,19 @@ class ThresholdCDF(EstimationMethod):
         result = apply_function_dense_chunks(
             noise_log_prob_coo=noise_log_prob_coo, fun=self.torch_cdf_fun, device=device, q=q
         )
-        return self._estimation_array_to_csr(data=result["result"], m=result["m"], noise_offsets=noise_offsets)
+        return self._estimation_array_to_csr(data=result["result"], m=result["m"])
 
 
-def _estimation_array_to_csr(
-    index_converter, data: np.ndarray, m: np.ndarray, noise_offsets: Optional[Dict[int, int]], dtype=COUNT_DATATYPE
-) -> sp.csr_matrix:
+def _estimation_array_to_csr(index_converter, data: np.ndarray, m: np.ndarray, dtype=COUNT_DATATYPE) -> sp.csr_matrix:
     """Say you have point estimates for each count matrix element (data) and
     you have the 'm'-indices for each value (m). This returns a CSR matrix
     that has the shape of the count matrix, where duplicate entries have
     been summed.
 
     Args:
-        data: Point estimates for each nonzero entry of the count matrix, in
-            a flat format, indexed by 'm'.
+        data: Point estimates (absolute noise counts) for each nonzero entry
+            of the count matrix, in a flat format, indexed by 'm'.
         m: Array of the same length as data, where each entry is an m-index.
-        noise_offsets: Noise count offset values keyed by 'm'.
         dtype: Data type for values of sparse matrix
 
     Results:
@@ -228,8 +202,6 @@ def _estimation_array_to_csr(
 
     """
     row, col = index_converter.get_ng_indices(m_inds=m)
-    if noise_offsets is not None:
-        data = data + np.array([noise_offsets.get(i, 0) for i in m])
     coo = sp.coo_matrix(
         (data.astype(dtype), (row.astype(N_CELLS_DATATYPE), col.astype(N_GENES_DATATYPE))),
         shape=index_converter.matrix_shape,
@@ -242,32 +214,29 @@ def _estimation_array_to_csr(
 def _register_posterior(
     conn: "duckdb.DuckDBPyConnection",
     source: "PosteriorSource",
-    noise_offsets: Dict[int, int],
     index_converter: "IndexConverter",
 ) -> None:
     """Register the posterior data as a DuckDB relation named 'posterior'.
 
     When *source* is a :class:`pathlib.Path` the parquet file is registered as
-    a zero-copy view (offsets already embedded as the ``offset`` column).
-    When *source* is a :class:`scipy.sparse.coo_matrix` the matrix is
-    converted to a PyArrow Table and registered in-process.
+    a zero-copy view.  When *source* is a :class:`scipy.sparse.coo_matrix` the
+    matrix is converted to a PyArrow Table and registered in-process.  Column
+    'c' contains absolute noise counts in both cases.
     """
     if isinstance(source, Path):
         conn.execute(f"CREATE OR REPLACE VIEW posterior AS SELECT * FROM read_parquet('{source}')")
     else:
-        # COO matrix path: build Arrow table with embedded offsets
+        # COO matrix path: build Arrow table from the COO
         coo = source
         rows = coo.row.astype("int32")
         cols = coo.col.astype("int16")
         data = coo.data.astype("float32")
         cell_ids, gene_ids = index_converter.get_ng_indices(m_inds=rows)
-        offsets = np.array([noise_offsets.get(int(m), 0) for m in rows], dtype="int16")
         table = pa.table(
             {
                 "cell_id": pa.array(cell_ids.astype("int32"), type=pa.int32()),
                 "gene_id": pa.array(gene_ids.astype("int32"), type=pa.int32()),
                 "c": pa.array(cols, type=pa.int16()),
-                "noise_offset": pa.array(offsets, type=pa.int16()),
                 "log_prob": pa.array(data, type=pa.float32()),
                 "regularized": pa.array(np.zeros(len(rows), dtype=bool), type=pa.bool_()),
             }
@@ -302,7 +271,6 @@ class MultipleChoiceKnapsack(EstimationMethod):
     def estimate_noise(
         self,
         noise_log_prob_coo: "PosteriorSource",
-        noise_offsets: Optional[Dict[int, int]],
         noise_targets_per_gene: Optional[np.ndarray] = None,
         verbose: bool = False,
         n_chunks: Optional[int] = None,
@@ -315,8 +283,7 @@ class MultipleChoiceKnapsack(EstimationMethod):
         Args:
             noise_log_prob_coo: Either a (m, c) COO matrix with log probabilities,
                 or a Path to a posterior parquet file written by CellBender.
-            noise_offsets: Noise count offset values keyed by 'm' (only used when
-                source is a COO matrix; ignored for parquet since offsets are embedded).
+                Column 'c' stores absolute noise counts in both cases.
             noise_targets_per_gene: Integer noise count target per gene (required).
             verbose: Print intermediate DuckDB results for debugging.
             n_chunks: Ignored; DuckDB handles memory management internally.
@@ -331,26 +298,18 @@ class MultipleChoiceKnapsack(EstimationMethod):
             "noise_targets_per_gene is required for MultipleChoiceKnapsack.estimate_noise"
         )
 
-        # When source is a parquet Path, offsets are embedded — no external dict needed.
-        if isinstance(noise_log_prob_coo, Path):
-            noise_offsets = {}
-
-        if noise_offsets is None:
-            noise_offsets = {}
-
         t0 = time.time()
 
         conn = duckdb.connect()
         conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
-        _register_posterior(conn, noise_log_prob_coo, noise_offsets, self.index_converter)
+        _register_posterior(conn, noise_log_prob_coo, self.index_converter)
 
         # Step 1: MAP estimate — argmax of log_prob per (cell_id, gene_id)
         map_df = conn.execute("""
             SELECT
                 cell_id,
                 gene_id,
-                CAST(argmax(c, log_prob) AS INTEGER) AS map_c,
-                CAST(any_value(noise_offset) AS INTEGER) AS noise_offset
+                CAST(argmax(c, log_prob) AS INTEGER) AS map_c
             FROM posterior
             WHERE NOT regularized
             GROUP BY cell_id, gene_id
@@ -359,11 +318,11 @@ class MultipleChoiceKnapsack(EstimationMethod):
         if verbose:
             logger.debug("MAP head:\n%s", map_df.head(10).to_string())
 
-        # MAP noise counts per gene (offset-adjusted)
+        # MAP noise counts per gene ('c' is already absolute)
         map_csr = _ng_arrays_to_csr(
             cell_ids=map_df["cell_id"].values,
             gene_ids=map_df["gene_id"].values,
-            data=(map_df["map_c"].values + map_df["noise_offset"].values).astype(COUNT_DATATYPE),
+            data=map_df["map_c"].values.astype(COUNT_DATATYPE),
             shape=self.index_converter.matrix_shape,
         )
         map_noise_per_gene = np.asarray(map_csr.sum(axis=0)).squeeze()
@@ -472,7 +431,7 @@ class MultipleChoiceKnapsack(EstimationMethod):
 
 
 def chunked_iterator(
-    coo: sp.coo_matrix, max_dense_batch_size_GB: float = 1.0
+    coo: sp.coo_matrix, max_dense_batch_size_GB: float = 1.0, n_counts_max: int = 20
 ) -> Generator[Tuple[sp.coo_matrix, np.ndarray, np.ndarray], None, None]:
     """Return an iterator which yields the full dataset in chunks.
 
@@ -482,18 +441,22 @@ def chunked_iterator(
 
     Args:
         coo: Sparse COO matrix with rows as generalized 'm'-indices and
-            columns as noise count values.
+            columns as absolute noise count values.
         max_dense_batch_size_GB: Size of a batch on disk, in gigabytes.
+        n_counts_max: Maximum number of distinct noise count values per row,
+            used to estimate the dense batch size.
 
     Returns:
-        A generator that yields compact CSR sparse matrices until the whole dataset
-        has been yielded. "Compact" in the sense that if they are made dense, there
-        will be no all-zero rows.
-            Tuple[chunk csr, actual row values in the full matrix]
+        A generator that yields compact COO sparse matrices until the whole
+        dataset has been yielded. Each tuple is
+            (chunk_coo, unique_row_values, unique_col_values)
+        where unique_col_values are the absolute noise counts present in
+        the chunk, and chunk_coo uses compact 0-based indices into those
+        arrays.
 
     """
     n_elements_in_batch = max_dense_batch_size_GB * 1e9 / 4  # torch float32 is 4 bytes
-    batch_size = max(1, int(np.floor(n_elements_in_batch / coo.shape[1])))
+    batch_size = max(1, int(np.floor(n_elements_in_batch / n_counts_max)))
 
     # COO rows are not necessarily contiguous or in order
     unique_m_values = np.unique(coo.row)
@@ -514,22 +477,30 @@ def chunked_iterator(
 
 
 def apply_function_dense_chunks(
-    noise_log_prob_coo: sp.coo_matrix, fun: Callable[..., torch.Tensor], device: str = "cpu", **kwargs
+    noise_log_prob_coo: sp.coo_matrix,
+    fun: Callable[..., torch.Tensor],
+    device: str = "cpu",
+    n_counts_max: int = 20,
+    **kwargs,
 ) -> Dict[str, np.ndarray]:
     """Uses chunked_iterator to densify chunked portions of a COO sparse
     matrix and then applies a function to the dense chunks, keeping track
     of the results per row.
 
     NOTE: The function should produce one value per row of the dense matrix.
-          The COO should contain log probability in data.
+          The COO should contain log probability in data, with absolute noise
+          counts as column indices.
 
     Args:
         noise_log_prob_coo: The posterior noise count log prob data structure,
-            indexed by 'm' as rows
+            indexed by 'm' as rows; columns are absolute noise counts.
         fun: Pytorch function that operates on a dense tensor and produces
-            one value per row
-        device: ['cpu', 'cuda'] - whether to perform the pytorch sampling
-            operation on CPU or GPU. It's pretty fast on CPU already.
+            one value per row. Must accept col_values as a keyword argument
+            (a float32 tensor of the absolute noise count for each compact
+            column in the chunk).
+        device: ['cpu', 'cuda'] - whether to perform the pytorch operation.
+        n_counts_max: Maximum distinct noise count values per row; used for
+            batch-size estimation.
         **kwargs: Passed to fun
 
     Returns:
@@ -544,12 +515,13 @@ def apply_function_dense_chunks(
     out = np.zeros(array_length)
     a = 0
 
-    for coo, row, col in chunked_iterator(coo=noise_log_prob_coo):
+    for coo, row, col in chunked_iterator(coo=noise_log_prob_coo, n_counts_max=n_counts_max):
         dense_tensor = torch.tensor(log_prob_sparse_to_dense(coo)).to(device)
         if torch.numel(dense_tensor) == 0:
             # github issue 207
             continue
-        s = fun(dense_tensor, **kwargs)
+        col_values = torch.tensor(col, dtype=dense_tensor.dtype).to(device)
+        s = fun(dense_tensor, col_values=col_values, **kwargs)
         if s.ndim == 0:
             # avoid "TypeError: len() of a 0-d tensor"
             len_s = 1

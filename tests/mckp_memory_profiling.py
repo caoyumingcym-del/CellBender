@@ -71,7 +71,6 @@ def compute_noise_counts(
     noise_csr = estimator.estimate_noise(
         estimator=estimator,
         noise_log_prob_coo=posterior_coo,
-        noise_offsets=posterior._noise_count_posterior_coo_offsets,
         noise_targets_per_gene=noise_targets,
         **kwargs,
     )
@@ -87,7 +86,6 @@ def get_noise_targets(posterior, fpr=0.01):
 
     noise_target_fun_per_cell = compute_mean_target_removal_as_function(
         noise_count_posterior_coo=posterior._noise_count_posterior_coo,
-        noise_offsets=posterior._noise_count_posterior_coo_offsets,
         index_converter=posterior.index_converter,
         raw_count_csr_for_cells=cell_counts,
         n_cells=len(cell_inds),
