@@ -85,7 +85,7 @@ class SingleSample(EstimationMethod):
         self,
         noise_log_prob_coo: "PosteriorSource",
         device: str = "cpu",
-        duckdb_memory_limit: str = "32GB",
+        duckdb_memory_limit: Optional[str] = None,
         **kwargs,
     ) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts by
@@ -96,7 +96,8 @@ class SingleSample(EstimationMethod):
                 values and absolute noise count columns, or a Path to a
                 posterior parquet file.
             device: ['cpu', 'cuda'] - only used for the COO path.
-            duckdb_memory_limit: DuckDB memory cap; only used for the parquet path.
+            duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'); only used for the parquet
+                path. When None, DuckDB auto-detects (~80% of system RAM).
 
         Returns:
             noise_count_csr: Estimated noise count matrix.
@@ -133,7 +134,7 @@ class Mean(EstimationMethod):
         self,
         noise_log_prob_coo: "PosteriorSource",
         device: str = "cpu",
-        duckdb_memory_limit: str = "32GB",
+        duckdb_memory_limit: Optional[str] = None,
         **kwargs,
     ) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts by
@@ -144,7 +145,8 @@ class Mean(EstimationMethod):
                 values and absolute noise count columns, or a Path to a
                 posterior parquet file.
             device: ['cpu', 'cuda'] - only used for the COO path.
-            duckdb_memory_limit: DuckDB memory cap; only used for the parquet path.
+            duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'); only used for the parquet
+                path. When None, DuckDB auto-detects (~80% of system RAM).
 
         Returns:
             noise_count_csr: Estimated noise count matrix.
@@ -202,7 +204,7 @@ class MAP(EstimationMethod):
         self,
         noise_log_prob_coo: "PosteriorSource",
         device: str = "cpu",
-        duckdb_memory_limit: str = "32GB",
+        duckdb_memory_limit: Optional[str] = None,
         **kwargs,
     ) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts by
@@ -213,7 +215,8 @@ class MAP(EstimationMethod):
                 values and absolute noise count columns, or a Path to a
                 posterior parquet file.
             device: ['cpu', 'cuda'] - only used for the COO path.
-            duckdb_memory_limit: DuckDB memory cap; only used for the parquet path.
+            duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'); only used for the parquet
+                path. When None, DuckDB auto-detects (~80% of system RAM).
 
         Returns:
             noise_count_csr: Estimated noise count matrix.
@@ -254,7 +257,7 @@ class ThresholdCDF(EstimationMethod):
         noise_log_prob_coo: "PosteriorSource",
         q: float = 0.5,
         device: str = "cpu",
-        duckdb_memory_limit: str = "32GB",
+        duckdb_memory_limit: Optional[str] = None,
         **kwargs,
     ) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts
@@ -265,7 +268,8 @@ class ThresholdCDF(EstimationMethod):
                 posterior parquet file.
             q: The CDF threshold value.
             device: ['cpu', 'cuda'] - only used for the COO path.
-            duckdb_memory_limit: DuckDB memory cap; only used for the parquet path.
+            duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'); only used for the parquet
+                path. When None, DuckDB auto-detects (~80% of system RAM).
 
         Returns:
             noise_count_csr: Estimated noise count matrix.
@@ -390,7 +394,7 @@ def _estimate_via_sql(
     index_converter: "IndexConverter",
     query: str,
     dtype=COUNT_DATATYPE,
-    duckdb_memory_limit: str = "32GB",
+    duckdb_memory_limit: Optional[str] = None,
 ) -> sp.csr_matrix:
     """Register the posterior source and run a SQL estimation query.
 
@@ -399,13 +403,15 @@ def _estimate_via_sql(
         index_converter: Determines output matrix shape.
         query: SQL selecting columns (cell_id, gene_id, noise_count).
         dtype: Data type for output CSR values.
-        duckdb_memory_limit: DuckDB memory cap (e.g. '8GB').
+        duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'). When None,
+            DuckDB auto-detects (~80% of system RAM).
 
     Returns:
         Estimated noise count CSR matrix.
     """
     conn = duckdb.connect()
-    conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    if duckdb_memory_limit is not None:
+        conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
     _register_posterior(conn, source, index_converter)
     df = conn.execute(query).df()
     return _ng_arrays_to_csr(
@@ -431,7 +437,7 @@ class MultipleChoiceKnapsack(EstimationMethod):
         verbose: bool = False,
         n_chunks: Optional[int] = None,
         use_multiple_processes: bool = False,
-        duckdb_memory_limit: str = "32GB",
+        duckdb_memory_limit: Optional[str] = None,
         **kwargs,
     ) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts via MCKP.
@@ -445,7 +451,8 @@ class MultipleChoiceKnapsack(EstimationMethod):
             n_chunks: Ignored; DuckDB handles memory management internally.
             use_multiple_processes: Ignored; DuckDB is multi-threaded internally.
             duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'). DuckDB spills to
-                disk when this limit is reached.
+                disk when this limit is reached. When None, DuckDB auto-detects
+                (~80% of system RAM).
 
         Returns:
             noise_count_csr: Estimated noise count CSR matrix.
@@ -457,7 +464,8 @@ class MultipleChoiceKnapsack(EstimationMethod):
         t0 = time.time()
 
         conn = duckdb.connect()
-        conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+        if duckdb_memory_limit is not None:
+            conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
         _register_posterior(conn, noise_log_prob_coo, self.index_converter)
 
         # Step 1: MAP estimate — argmax of log_prob per (cell_id, gene_id)

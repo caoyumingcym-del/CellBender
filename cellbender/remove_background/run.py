@@ -329,6 +329,7 @@ def compute_output_denoised_counts_reports_metrics(
             alpha=args.prq_alpha,
             device="cuda" if args.use_cuda else "cpu",
             use_multiple_processes=args.use_multiprocessing_estimation,
+            duckdb_memory_limit=args.duckdb_memory_limit,
         )
 
         # Restore eliminated features in cells.

@@ -378,6 +378,15 @@ def add_subparser_args(subparsers: argparse._SubParsersAction) -> argparse._SubP
         help="Number of threads to use when pytorch is run on CPU. Defaults to the number of logical cores.",
     )
     subparser.add_argument(
+        "--estimator-memory-limit",
+        type=str,
+        default=None,
+        dest="duckdb_memory_limit",
+        help="Memory limit for DuckDB SQL-based noise count estimation (e.g. '30GB'). "
+        "Defaults to DuckDB's automatic limit (~80%% of system RAM). "
+        "Useful on shared cluster nodes where you want to cap CellBender's memory footprint.",
+    )
+    subparser.add_argument(
         "--debug",
         dest="debug",
         action="store_true",
