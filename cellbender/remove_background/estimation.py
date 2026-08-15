@@ -44,12 +44,12 @@ class EstimationMethod(ABC):
         super(EstimationMethod, self).__init__()
 
     @abstractmethod
-    def estimate_noise(self, noise_log_prob_coo: sp.coo_matrix, **kwargs) -> sp.csr_matrix:
+    def estimate_noise(self, noise_log_prob_coo: "PosteriorSource", **kwargs) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts.
         Args:
-            noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix where col values are absolute
-                noise counts.
+            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
+                values and absolute noise count columns, or a Path to a
+                posterior parquet file.
         """
         pass
 
@@ -81,20 +81,43 @@ class SingleSample(EstimationMethod):
     """A single sample from the noise count posterior"""
 
     @torch.no_grad()
-    def estimate_noise(self, noise_log_prob_coo: sp.coo_matrix, device: str = "cpu", **kwargs) -> sp.csr_matrix:
+    def estimate_noise(
+        self,
+        noise_log_prob_coo: "PosteriorSource",
+        device: str = "cpu",
+        duckdb_memory_limit: str = "32GB",
+        **kwargs,
+    ) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts by
         taking a single sample from each probability distribution.
 
         Args:
-            noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix where col values are absolute
-                noise counts.
-            device: ['cpu', 'cuda'] - whether to perform the pytorch sampling
-                operation on CPU or GPU. It's pretty fast on CPU already.
+            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
+                values and absolute noise count columns, or a Path to a
+                posterior parquet file.
+            device: ['cpu', 'cuda'] - only used for the COO path.
+            duckdb_memory_limit: DuckDB memory cap; only used for the parquet path.
 
         Returns:
             noise_count_csr: Estimated noise count matrix.
         """
+        if isinstance(noise_log_prob_coo, Path):
+            # Gumbel-max trick: argmax(log_p_i + Gumbel(0,1)_i) ~ Categorical(softmax(log_p))
+            query = """
+                SELECT
+                    cell_id,
+                    gene_id,
+                    CAST(argmax(c, log_prob - LN(-LN(random()))) AS INTEGER) AS noise_count
+                FROM posterior
+                WHERE NOT regularized
+                GROUP BY cell_id, gene_id
+            """
+            return _estimate_via_sql(
+                noise_log_prob_coo,
+                self.index_converter,
+                query,
+                duckdb_memory_limit=duckdb_memory_limit,
+            )
 
         def _torch_sample(x, col_values, **kw):
             return col_values[Categorical(logits=x, validate_args=False).sample().long()]
@@ -106,18 +129,60 @@ class SingleSample(EstimationMethod):
 class Mean(EstimationMethod):
     """Posterior mean"""
 
-    def estimate_noise(self, noise_log_prob_coo: sp.coo_matrix, device: str = "cpu", **kwargs) -> sp.csr_matrix:
+    def estimate_noise(
+        self,
+        noise_log_prob_coo: "PosteriorSource",
+        device: str = "cpu",
+        duckdb_memory_limit: str = "32GB",
+        **kwargs,
+    ) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts by
         taking the mean of each probability distribution.
 
         Args:
-            noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix where col values are absolute
-                noise counts.
+            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
+                values and absolute noise count columns, or a Path to a
+                posterior parquet file.
+            device: ['cpu', 'cuda'] - only used for the COO path.
+            duckdb_memory_limit: DuckDB memory cap; only used for the parquet path.
 
         Returns:
             noise_count_csr: Estimated noise count matrix.
         """
+        if isinstance(noise_log_prob_coo, Path):
+            # Log-max shift for numerical stability before exponentiation.
+            query = """
+                WITH shifted AS (
+                    SELECT
+                        cell_id,
+                        gene_id,
+                        c,
+                        EXP(log_prob - MAX(log_prob) OVER (PARTITION BY cell_id, gene_id)) AS prob_raw
+                    FROM posterior
+                    WHERE NOT regularized
+                ),
+                normalized AS (
+                    SELECT
+                        cell_id,
+                        gene_id,
+                        c,
+                        prob_raw / SUM(prob_raw) OVER (PARTITION BY cell_id, gene_id) AS prob
+                    FROM shifted
+                )
+                SELECT
+                    cell_id,
+                    gene_id,
+                    SUM(CAST(c AS DOUBLE) * prob) AS noise_count
+                FROM normalized
+                GROUP BY cell_id, gene_id
+            """
+            return _estimate_via_sql(
+                noise_log_prob_coo,
+                self.index_converter,
+                query,
+                dtype=np.float32,
+                duckdb_memory_limit=duckdb_memory_limit,
+            )
 
         def _torch_mean(x, col_values, **kw):
             return torch.matmul(x.exp(), col_values)
@@ -133,20 +198,43 @@ class MAP(EstimationMethod):
     def torch_argmax(x, col_values, **kwargs):
         return col_values[x.argmax(dim=-1).long()]
 
-    def estimate_noise(self, noise_log_prob_coo: sp.coo_matrix, device: str = "cpu", **kwargs) -> sp.csr_matrix:
+    def estimate_noise(
+        self,
+        noise_log_prob_coo: "PosteriorSource",
+        device: str = "cpu",
+        duckdb_memory_limit: str = "32GB",
+        **kwargs,
+    ) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts by
         taking the maximum a posteriori (MAP) of each probability distribution.
 
         Args:
-            noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix where col values are absolute
-                noise counts.
-            device: ['cpu', 'cuda'] - whether to perform the pytorch argmax
-                operation on CPU or GPU. It's pretty fast on CPU already.
+            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
+                values and absolute noise count columns, or a Path to a
+                posterior parquet file.
+            device: ['cpu', 'cuda'] - only used for the COO path.
+            duckdb_memory_limit: DuckDB memory cap; only used for the parquet path.
 
         Returns:
             noise_count_csr: Estimated noise count matrix.
         """
+        if isinstance(noise_log_prob_coo, Path):
+            query = """
+                SELECT
+                    cell_id,
+                    gene_id,
+                    CAST(argmax(c, log_prob) AS INTEGER) AS noise_count
+                FROM posterior
+                WHERE NOT regularized
+                GROUP BY cell_id, gene_id
+            """
+            return _estimate_via_sql(
+                noise_log_prob_coo,
+                self.index_converter,
+                query,
+                duckdb_memory_limit=duckdb_memory_limit,
+            )
+
         result = apply_function_dense_chunks(
             noise_log_prob_coo=noise_log_prob_coo, fun=self.torch_argmax, device=device
         )
@@ -163,22 +251,58 @@ class ThresholdCDF(EstimationMethod):
 
     def estimate_noise(
         self,
-        noise_log_prob_coo: sp.coo_matrix,
+        noise_log_prob_coo: "PosteriorSource",
         q: float = 0.5,
         device: str = "cpu",
+        duckdb_memory_limit: str = "32GB",
         **kwargs,
     ) -> sp.csr_matrix:
         """Given the full probabilistic posterior, compute noise counts
 
         Args:
-            noise_log_prob_coo: The noise log prob data structure: log prob
-                values in a (m, c) COO matrix where col values are absolute
-                noise counts.
+            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
+                values and absolute noise count columns, or a Path to a
+                posterior parquet file.
             q: The CDF threshold value.
+            device: ['cpu', 'cuda'] - only used for the COO path.
+            duckdb_memory_limit: DuckDB memory cap; only used for the parquet path.
 
         Returns:
             noise_count_csr: Estimated noise count matrix.
         """
+        if isinstance(noise_log_prob_coo, Path):
+            # COALESCE to MAX(c) handles the edge case where no entry's cumsum exceeds q.
+            query = f"""
+                WITH cumulative AS (
+                    SELECT
+                        cell_id,
+                        gene_id,
+                        c,
+                        SUM(EXP(log_prob)) OVER (
+                            PARTITION BY cell_id, gene_id
+                            ORDER BY c
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        ) AS cum_prob
+                    FROM posterior
+                    WHERE NOT regularized
+                )
+                SELECT
+                    cell_id,
+                    gene_id,
+                    CAST(COALESCE(
+                        MIN(CASE WHEN cum_prob > {q} THEN c END),
+                        MAX(c)
+                    ) AS INTEGER) AS noise_count
+                FROM cumulative
+                GROUP BY cell_id, gene_id
+            """
+            return _estimate_via_sql(
+                noise_log_prob_coo,
+                self.index_converter,
+                query,
+                duckdb_memory_limit=duckdb_memory_limit,
+            )
+
         result = apply_function_dense_chunks(
             noise_log_prob_coo=noise_log_prob_coo, fun=self.torch_cdf_fun, device=device, q=q
         )
@@ -259,6 +383,38 @@ def _ng_arrays_to_csr(
     )
     coo.sum_duplicates()
     return coo.tocsr()
+
+
+def _estimate_via_sql(
+    source: "PosteriorSource",
+    index_converter: "IndexConverter",
+    query: str,
+    dtype=COUNT_DATATYPE,
+    duckdb_memory_limit: str = "32GB",
+) -> sp.csr_matrix:
+    """Register the posterior source and run a SQL estimation query.
+
+    Args:
+        source: Path to a parquet file, or a COO sparse matrix.
+        index_converter: Determines output matrix shape.
+        query: SQL selecting columns (cell_id, gene_id, noise_count).
+        dtype: Data type for output CSR values.
+        duckdb_memory_limit: DuckDB memory cap (e.g. '8GB').
+
+    Returns:
+        Estimated noise count CSR matrix.
+    """
+    conn = duckdb.connect()
+    conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    _register_posterior(conn, source, index_converter)
+    df = conn.execute(query).df()
+    return _ng_arrays_to_csr(
+        cell_ids=df["cell_id"].values,
+        gene_ids=df["gene_id"].values,
+        data=df["noise_count"].values.astype(dtype),
+        shape=index_converter.matrix_shape,
+        dtype=dtype,
+    )
 
 
 class MultipleChoiceKnapsack(EstimationMethod):

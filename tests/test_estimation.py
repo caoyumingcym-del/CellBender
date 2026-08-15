@@ -1,14 +1,17 @@
 """Test functions in estimation.py"""
 
+from pathlib import Path
 from typing import Dict, Union
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 import scipy.sparse as sp
 import torch
 from conftest import sparse_matrix_equal
 
+from cellbender.remove_background.data.io import POSTERIOR_SCHEMA, write_posterior_batch_to_parquet
 from cellbender.remove_background.estimation import (
     COUNT_DATATYPE,
     MAP,
@@ -159,6 +162,41 @@ def mckp_log_prob_coo(request, log_prob_coo_base) -> Dict[str, Union[sp.coo_matr
     return {k: _fix(v) for k, v in out.items()}
 
 
+@pytest.fixture(scope="module")
+def log_prob_parquet(log_prob_coo_base, tmp_path_factory) -> Dict[str, Union[Path, np.ndarray, sp.coo_matrix]]:
+    """Write the base COO fixture to a parquet file for SQL-path tests.
+
+    Uses IndexConverter(total_n_cells=1, total_n_genes=n) so m == gene_id,
+    matching what the estimator tests use.
+    """
+    coo = log_prob_coo_base["coo"]
+    n_genes = coo.shape[0]
+    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
+
+    tmp_dir = tmp_path_factory.mktemp("parquet")
+    parquet_path = tmp_dir / "posterior.parquet"
+
+    cell_ids, gene_ids = converter.get_ng_indices(m_inds=coo.row.astype(np.int64))
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=cell_ids.astype(np.int32),
+        gene_ids=gene_ids.astype(np.int32),
+        c_vals=coo.col.astype(np.int16),
+        log_probs=coo.data.astype(np.float32),
+        regularized=False,
+    )
+    writer.close()
+
+    return {
+        "path": parquet_path,
+        "n_genes": n_genes,
+        "coo": coo,
+        "maps": log_prob_coo_base["maps"],
+        "cdfs": log_prob_coo_base["cdfs"],
+    }
+
+
 def test_single_sample(log_prob_coo):
     """Test the single sample estimator"""
 
@@ -276,6 +314,182 @@ def test_cdf(log_prob_coo):
 
     # test
     np.testing.assert_array_equal(out_per_m, log_prob_coo["cdfs"])
+
+
+# ---------------------------------------------------------------------------
+# SQL / parquet-path tests for MAP, Mean, ThresholdCDF, SingleSample
+# ---------------------------------------------------------------------------
+
+
+def test_map_from_parquet(log_prob_parquet):
+    """MAP from parquet path (SQL argmax) matches known truth."""
+    path = log_prob_parquet["path"]
+    n_genes = log_prob_parquet["n_genes"]
+    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
+    estimator = MAP(index_converter=converter)
+    noise_csr = estimator.estimate_noise(noise_log_prob_coo=path)
+    out_per_m = np.array(noise_csr.todense()).squeeze()
+    np.testing.assert_array_equal(out_per_m, log_prob_parquet["maps"])
+
+
+def test_mean_from_parquet(log_prob_parquet):
+    """Mean from parquet path (SQL weighted sum) matches brute-force truth."""
+    path = log_prob_parquet["path"]
+    n_genes = log_prob_parquet["n_genes"]
+    coo = log_prob_parquet["coo"]
+    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
+    estimator = Mean(index_converter=converter)
+    noise_csr = estimator.estimate_noise(noise_log_prob_coo=path)
+    out_per_m = np.array(noise_csr.todense()).squeeze()
+
+    dense = log_prob_sparse_to_dense(coo)
+    brute_force = np.matmul(np.arange(dense.shape[1]), np.exp(dense).T)
+    # rtol=1e-4: log_probs stored as float32 in parquet vs float64 brute force
+    np.testing.assert_allclose(out_per_m, brute_force, rtol=1e-4)
+
+
+def test_cdf_from_parquet(log_prob_parquet):
+    """ThresholdCDF from parquet path (SQL window cumsum) matches known truth."""
+    path = log_prob_parquet["path"]
+    n_genes = log_prob_parquet["n_genes"]
+    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
+    estimator = ThresholdCDF(index_converter=converter)
+    noise_csr = estimator.estimate_noise(noise_log_prob_coo=path, q=0.5)
+    out_per_m = np.array(noise_csr.todense()).squeeze()
+    np.testing.assert_array_equal(out_per_m, log_prob_parquet["cdfs"])
+
+
+def test_single_sample_from_parquet(log_prob_parquet):
+    """SingleSample from parquet path (Gumbel-max trick) returns valid noise counts."""
+    path = log_prob_parquet["path"]
+    n_genes = log_prob_parquet["n_genes"]
+    coo = log_prob_parquet["coo"]
+    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
+    estimator = SingleSample(index_converter=converter)
+    noise_csr = estimator.estimate_noise(noise_log_prob_coo=path)
+    out_per_m = np.array(noise_csr.todense()).squeeze()
+
+    dense = log_prob_sparse_to_dense(coo)
+    for i in range(1, coo.shape[0]):
+        row = dense[i, :]
+        if not np.any(row > -np.inf):
+            continue
+        allowed_vals = np.arange(dense.shape[1])[row > -np.inf]
+        assert out_per_m[i] in allowed_vals, f"sample {out_per_m[i]} not in allowed set for m={i}"
+
+
+# ---------------------------------------------------------------------------
+# Cross-path consistency: COO path == parquet path (deterministic estimators)
+# ---------------------------------------------------------------------------
+
+
+def test_map_coo_vs_parquet_consistency(log_prob_parquet):
+    """MAP produces identical results from COO and parquet inputs."""
+    coo = log_prob_parquet["coo"]
+    path = log_prob_parquet["path"]
+    n_genes = log_prob_parquet["n_genes"]
+    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
+    estimator = MAP(index_converter=converter)
+    assert sparse_matrix_equal(
+        estimator.estimate_noise(noise_log_prob_coo=coo),
+        estimator.estimate_noise(noise_log_prob_coo=path),
+    )
+
+
+def test_mean_coo_vs_parquet_consistency(log_prob_parquet):
+    """Mean produces close results from COO and parquet inputs."""
+    coo = log_prob_parquet["coo"]
+    path = log_prob_parquet["path"]
+    n_genes = log_prob_parquet["n_genes"]
+    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
+    estimator = Mean(index_converter=converter)
+    coo_result = np.array(estimator.estimate_noise(noise_log_prob_coo=coo).todense()).squeeze()
+    path_result = np.array(estimator.estimate_noise(noise_log_prob_coo=path).todense()).squeeze()
+    # float32 quantization in parquet vs float64 COO path
+    np.testing.assert_allclose(coo_result, path_result, rtol=1e-4)
+
+
+def test_cdf_coo_vs_parquet_consistency(log_prob_parquet):
+    """ThresholdCDF produces identical results from COO and parquet inputs."""
+    coo = log_prob_parquet["coo"]
+    path = log_prob_parquet["path"]
+    n_genes = log_prob_parquet["n_genes"]
+    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
+    estimator = ThresholdCDF(index_converter=converter)
+    assert sparse_matrix_equal(
+        estimator.estimate_noise(noise_log_prob_coo=coo, q=0.5),
+        estimator.estimate_noise(noise_log_prob_coo=path, q=0.5),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Edge-case tests
+# ---------------------------------------------------------------------------
+
+
+def test_cdf_parquet_coalesce_fallback(tmp_path_factory):
+    """ThresholdCDF returns max(c) when the whole distribution's mass is below q."""
+    tmp_dir = tmp_path_factory.mktemp("cdf_edge")
+    parquet_path = tmp_dir / "posterior.parquet"
+
+    # Two entries whose total probability (0.6) never exceeds q=0.9.
+    log_prob = float(np.log(0.3))
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.array([0, 0], dtype=np.int32),
+        gene_ids=np.array([0, 0], dtype=np.int32),
+        c_vals=np.array([5, 10], dtype=np.int16),
+        log_probs=np.array([log_prob, log_prob], dtype=np.float32),
+        regularized=False,
+    )
+    writer.close()
+
+    converter = IndexConverter(total_n_cells=1, total_n_genes=1)
+    estimator = ThresholdCDF(index_converter=converter)
+
+    # SQL path: COALESCE to MAX(c) = 10
+    result_parquet = estimator.estimate_noise(noise_log_prob_coo=parquet_path, q=0.9)
+    assert result_parquet.toarray()[0, 0] == 10
+
+    # COO path: clamp to len(col_values)-1 = 1, col_values[1] = 10
+    coo = sp.coo_matrix(
+        (np.array([log_prob, log_prob]), (np.array([0, 0]), np.array([5, 10]))),
+        shape=(1, 11),
+    )
+    result_coo = estimator.estimate_noise(noise_log_prob_coo=coo, q=0.9)
+    assert result_coo.toarray()[0, 0] == 10
+
+
+def test_mean_parquet_numerical_stability(tmp_path_factory):
+    """Mean SQL path uses log-max shift so extreme log_probs don't cause NaN."""
+    tmp_dir = tmp_path_factory.mktemp("mean_stability")
+    parquet_path = tmp_dir / "posterior.parquet"
+
+    # Extreme values that would cause EXP underflow without the stability trick.
+    # Without shift: EXP(-1000) = 0 in float64 → division by 0 → NaN.
+    cs = np.array([3, 5], dtype=np.int16)
+    log_probs = np.array([-1000.0, -1001.0], dtype=np.float32)
+
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.zeros(2, dtype=np.int32),
+        gene_ids=np.zeros(2, dtype=np.int32),
+        c_vals=cs,
+        log_probs=log_probs,
+        regularized=False,
+    )
+    writer.close()
+
+    converter = IndexConverter(total_n_cells=1, total_n_genes=1)
+    result = Mean(index_converter=converter).estimate_noise(noise_log_prob_coo=parquet_path)
+
+    assert np.isfinite(result.toarray()[0, 0]), "Mean returned NaN/Inf for extreme log_probs"
+    # p(c=3) = e^0 / (e^0 + e^{-1}),  p(c=5) = e^{-1} / (e^0 + e^{-1})
+    denom = 1.0 + np.exp(-1.0)
+    expected = 3.0 / denom + 5.0 * np.exp(-1.0) / denom
+    np.testing.assert_allclose(result.toarray()[0, 0], expected, rtol=1e-4)
 
 
 @pytest.mark.parametrize(
