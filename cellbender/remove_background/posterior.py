@@ -566,7 +566,7 @@ class Posterior:
 
                 # Per-entry noise offsets (add to compact c to get absolute noise count).
                 offset_i = noise_count_offset_NG[bcs_i_chunk, genes_i_analyzed].detach().cpu()
-                c_i_absolute = (c_i + offset_i).numpy().astype(np.int16)
+                c_i_absolute = (c_i.detach().cpu() + offset_i).numpy().astype(np.int16)
 
                 # Stream this batch to parquet with absolute c values.
                 write_posterior_batch_to_parquet(
