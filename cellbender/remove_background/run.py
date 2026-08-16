@@ -244,7 +244,7 @@ def compute_output_denoised_counts_reports_metrics(
     """
 
     # Ensure that the posterior distribution has been computed.
-    posterior.ensure_posterior_computed(duckdb_memory_limit=args.duckdb_memory_limit)
+    posterior.ensure_posterior_computed()
 
     assert posterior.dataset_obj is not None and posterior.dataset_obj.data is not None
 
@@ -345,8 +345,7 @@ def compute_output_denoised_counts_reports_metrics(
 
         def _writer_helper(file, **kwargs) -> bool:
             _dataset_obj = posterior.dataset_obj
-            _vi_model = posterior.vi_model
-            assert _dataset_obj is not None and _vi_model is not None
+            assert _dataset_obj is not None
             return write_denoised_count_matrix(
                 file=file,
                 denoised_count_matrix=denoised_counts,
@@ -356,7 +355,7 @@ def compute_output_denoised_counts_reports_metrics(
                 estimator_kwargs=None if (args.cdf_threshold_q is None) else {"q": args.cdf_threshold_q},
                 latents=posterior.latents_map,
                 dataset_obj=_dataset_obj,
-                learning_curve=_vi_model.loss,
+                learning_curve=posterior.model_loss,
                 fpr=fpr,
                 **kwargs,
             )
@@ -382,7 +381,7 @@ def compute_output_denoised_counts_reports_metrics(
                 inferred_count_matrix=denoised_counts,
                 fpr=fpr,
                 cell_logic=(posterior.latents_map["p"] >= consts.CELL_PROB_CUTOFF),
-                loss=posterior.vi_model.loss,
+                loss=posterior.model_loss,
             )
             metrics_file_name = os.path.join(file_dir, file_name + name_suffix + "_metrics.csv")
             df.to_csv(metrics_file_name, index=True, header=False, float_format="%.3f")

@@ -175,7 +175,10 @@ def load_or_compute_posterior_and_save(
         # Compute posterior.
         logger.info("Posterior not currently included in checkpoint.")
         posterior_parquet_file = args.output_file[:-3] + "_posterior.parquet"
-        posterior.ensure_posterior_computed(path=Path(posterior_parquet_file))
+        posterior.ensure_posterior_computed(
+            path=Path(posterior_parquet_file),
+            duckdb_memory_limit=args.duckdb_memory_limit,
+        )
         _do_posterior_regularization(posterior)
 
         # Save posterior and add it to checkpoint tarball.
@@ -268,6 +271,7 @@ class Posterior:
         self._noise_count_regularized_posterior_coo: sp.coo_matrix | None = None
         self._noise_count_regularized_posterior_kwargs: dict | None = None
         self._latents: Dict[str, np.ndarray] | None = None
+        self._model_loss: dict = {}
         if dataset_obj is not None and dataset_obj.data is not None:
             self.index_converter = IndexConverter(
                 total_n_cells=dataset_obj.data["matrix"].shape[0],
@@ -461,6 +465,14 @@ class Posterior:
         assert self._latents is not None
         return self._latents
 
+    @property
+    def model_loss(self) -> dict:
+        """Training loss curve. Returns the live value when vi_model is loaded,
+        or the cached copy after vi_model has been freed."""
+        if self.vi_model is not None:
+            return self.vi_model.loss
+        return self._model_loss
+
     @torch.no_grad()
     def _compute_and_stream_posterior(
         self,
@@ -584,9 +596,13 @@ class Posterior:
 
                 ind += data.shape[0]
 
+        # Cache the training loss curve before freeing the model, so it remains
+        # accessible for writing to the output h5 file.
+        if self.vi_model is not None:
+            self._model_loss = self.vi_model.loss
         # Model is no longer needed: latents were computed at the start of this
-        # function (line ~491) and are cached in self._latents. Freeing the model
-        # now reduces memory pressure during the sort that follows.
+        # function (~line 491) and are cached in self._latents. Freeing it now
+        # reduces memory pressure during the sort that follows.
         self.vi_model = None
         torch.cuda.empty_cache()
 
