@@ -22,7 +22,12 @@ from cellbender.remove_background.estimation import (
     _estimation_array_to_csr,
     pandas_grouped_apply,
 )
-from cellbender.remove_background.posterior import IndexConverter, dense_to_sparse_op_torch, log_prob_sparse_to_dense
+from cellbender.remove_background.posterior import (
+    IndexConverter,
+    compute_mean_target_removal_as_function,
+    dense_to_sparse_op_torch,
+    log_prob_sparse_to_dense,
+)
 
 
 @pytest.fixture(scope="module")
@@ -490,6 +495,39 @@ def test_mean_parquet_numerical_stability(tmp_path_factory):
     denom = 1.0 + np.exp(-1.0)
     expected = 3.0 / denom + 5.0 * np.exp(-1.0) / denom
     np.testing.assert_allclose(result.toarray()[0, 0], expected, rtol=1e-4)
+
+
+def test_compute_mean_target_removal_from_parquet(log_prob_parquet):
+    """compute_mean_target_removal_as_function accepts a parquet Path and agrees with the COO path."""
+    path = log_prob_parquet["path"]
+    coo = log_prob_parquet["coo"]
+    n_genes = log_prob_parquet["n_genes"]
+    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
+
+    # Simple raw count matrix: one count per gene (shape matches the 1-cell converter)
+    raw_counts = sp.csr_matrix(np.ones((1, n_genes), dtype=np.float32))
+
+    target_fun_parquet = compute_mean_target_removal_as_function(
+        noise_count_posterior_coo=path,
+        index_converter=converter,
+        raw_count_csr_for_cells=raw_counts,
+        n_cells=1,
+        device="cpu",
+        per_gene=True,
+    )
+    result_parquet = target_fun_parquet(0.01).numpy()
+
+    target_fun_coo = compute_mean_target_removal_as_function(
+        noise_count_posterior_coo=coo,
+        index_converter=converter,
+        raw_count_csr_for_cells=raw_counts,
+        n_cells=1,
+        device="cpu",
+        per_gene=True,
+    )
+    result_coo = target_fun_coo(0.01).numpy()
+
+    np.testing.assert_allclose(result_parquet, result_coo, rtol=1e-4)
 
 
 @pytest.mark.parametrize(

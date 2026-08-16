@@ -41,6 +41,7 @@ from cellbender.remove_background.estimation import (
     MAP,
     EstimationMethod,
     Mean,
+    PosteriorSource,
     apply_function_dense_chunks,
 )
 from cellbender.remove_background.model import calculate_lambda, calculate_mu
@@ -1553,7 +1554,7 @@ class IndexConverter:
 
 
 def compute_mean_target_removal_as_function(
-    noise_count_posterior_coo: sp.coo_matrix,
+    noise_count_posterior_coo: "PosteriorSource",
     index_converter: IndexConverter,
     raw_count_csr_for_cells: sp.csr_matrix,
     n_cells: int,
@@ -1568,8 +1569,10 @@ def compute_mean_target_removal_as_function(
     multiplying this by the number of cells in question.
 
     Args:
-        noise_count_posterior_coo: Noise count posterior log prob COO with
-            absolute noise counts as column indices.
+        noise_count_posterior_coo: Noise count posterior — either a COO sparse
+            matrix with absolute noise counts as column indices, or a Path to
+            a posterior parquet file. When a Path is given, the Mean estimator
+            runs via DuckDB SQL without loading the full posterior into RAM.
         index_converter: IndexConverter object from 'm' to (n, g) and back
         raw_count_csr_for_cells: The input count matrix for only the cells
             included in the posterior
