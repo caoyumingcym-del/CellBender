@@ -244,10 +244,9 @@ def compute_output_denoised_counts_reports_metrics(
     """
 
     # Ensure that the posterior distribution has been computed.
-    posterior.ensure_posterior_computed()
+    posterior.ensure_posterior_computed(duckdb_memory_limit=args.duckdb_memory_limit)
 
     assert posterior.dataset_obj is not None and posterior.dataset_obj.data is not None
-    assert posterior.vi_model is not None
 
     # Choose output count matrix estimation method.
     from cellbender.remove_background.estimation import EstimationMethod
@@ -377,6 +376,7 @@ def compute_output_denoised_counts_reports_metrics(
 
         # Compile and save metrics.
         try:
+            assert isinstance(posterior.vi_model, RemoveBackgroundPyroModel)  # mypy
             df = collect_output_metrics(
                 dataset_obj=posterior.dataset_obj,
                 inferred_count_matrix=denoised_counts,

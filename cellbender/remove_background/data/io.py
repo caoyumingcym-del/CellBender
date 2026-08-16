@@ -265,13 +265,20 @@ def write_posterior_batch_to_parquet(
     writer.write_table(batch)
 
 
-def sort_posterior_parquet(path: Path) -> None:
+def sort_posterior_parquet(path: Path, duckdb_memory_limit: "Optional[str]" = None) -> None:
     """Re-write the posterior parquet sorted by (gene_id, cell_id) for efficient DuckDB scans."""
     import duckdb
     tmp = Path(str(path) + '.tmp')
     path_str = str(path).replace("'", "''")
     tmp_str  = str(tmp).replace("'", "''")
-    duckdb.sql(
+    tmp_dir  = str(path.parent).replace("'", "''")
+    conn = duckdb.connect()
+    # Always spill to the output directory rather than /tmp, which may be a
+    # RAM-backed tmpfs inside Docker containers.
+    conn.execute(f"SET temp_directory='{tmp_dir}'")
+    if duckdb_memory_limit is not None:
+        conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    conn.execute(
         f"COPY (SELECT * FROM read_parquet('{path_str}') ORDER BY gene_id, cell_id) "
         f"TO '{tmp_str}' (FORMAT PARQUET, COMPRESSION 'snappy')"
     )

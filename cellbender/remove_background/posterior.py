@@ -469,6 +469,7 @@ class Posterior:
         y_map: bool = True,
         n_counts_max: int = 20,
         smallest_log_probability: float = -10.0,
+        duckdb_memory_limit: Optional[str] = None,
     ) -> None:
         """Compute posterior noise count probabilities and stream them to parquet.
 
@@ -478,6 +479,8 @@ class Posterior:
             y_map: Use MAP estimate of y (cell/empty) instead of sampling.
             n_counts_max: Maximum noise count axis size.
             smallest_log_probability: Entries below this threshold are discarded.
+            duckdb_memory_limit: DuckDB memory cap for the post-streaming sort
+                (e.g. '4GB'). When None, DuckDB auto-detects (~80% of RAM).
 
         """
 
@@ -581,8 +584,14 @@ class Posterior:
 
                 ind += data.shape[0]
 
+        # Model is no longer needed: latents were computed at the start of this
+        # function (line ~491) and are cached in self._latents. Freeing the model
+        # now reduces memory pressure during the sort that follows.
+        self.vi_model = None
+        torch.cuda.empty_cache()
+
         # Sort parquet for efficient DuckDB scans.
-        sort_posterior_parquet(path)
+        sort_posterior_parquet(path, duckdb_memory_limit=duckdb_memory_limit)
 
         # Write per-barcode latents CSV sidecar.
         write_posterior_latents_csv(_posterior_latents_path(path), self.latents_map)

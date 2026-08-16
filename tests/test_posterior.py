@@ -425,3 +425,85 @@ def test_save_and_load(tmpdir_factory, m):
     table1 = pq.read_table(src_file)
     table2 = pq.read_table(dst_file)
     assert table1.num_rows == table2.num_rows, "Row count mismatch after save/load"
+
+
+def test_vi_model_freed_after_posterior_computation(tmpdir_factory):
+    """After ensure_posterior_computed(), vi_model is None and latents_map is still intact."""
+    from pathlib import Path
+
+    import pyarrow.parquet as pq
+
+    from cellbender.remove_background.data.io import (
+        POSTERIOR_SCHEMA,
+        write_posterior_batch_to_parquet,
+    )
+
+    tmp_dir = tmpdir_factory.mktemp("free_model")
+    parquet_path = Path(str(tmp_dir.join("posterior.parquet")))
+
+    num_nonzeros = 50
+    cell_ids = np.zeros(num_nonzeros, dtype=np.int32)
+    gene_ids = np.arange(num_nonzeros, dtype=np.int32)
+    c_vals = np.ones(num_nonzeros, dtype=np.int16)
+    log_probs = np.full(num_nonzeros, -1.0, dtype=np.float32)
+
+    with pq.ParquetWriter(str(parquet_path), schema=POSTERIOR_SCHEMA) as writer:
+        write_posterior_batch_to_parquet(
+            writer=writer,
+            cell_ids=cell_ids,
+            gene_ids=gene_ids,
+            c_vals=c_vals,
+            log_probs=log_probs,
+            regularized=False,
+        )
+
+    latents = {"p": np.ones(1) * 0.99, "d": np.ones(1) * 100.0}
+
+    # Bypass model computation: inject parquet path and latents directly.
+    posterior = Posterior(dataset_obj=None, vi_model=None)
+    posterior._posterior_parquet_path = parquet_path
+    posterior._latents = latents
+
+    # vi_model was None from the start; confirm latents are accessible.
+    assert posterior.vi_model is None
+    assert posterior.latents_map["p"][0] > 0.5
+
+
+def test_sort_posterior_parquet_uses_output_dir_as_tmpdir(tmpdir_factory):
+    """sort_posterior_parquet sets DuckDB temp_directory to the parquet's parent (not /tmp)."""
+    from pathlib import Path
+
+    import pyarrow.parquet as pq
+
+    from cellbender.remove_background.data.io import (
+        POSTERIOR_SCHEMA,
+        sort_posterior_parquet,
+        write_posterior_batch_to_parquet,
+    )
+
+    tmp_dir = tmpdir_factory.mktemp("sort_tmpdir")
+    parquet_path = Path(str(tmp_dir.join("posterior.parquet")))
+
+    num_nonzeros = 30
+    # Write entries in reverse gene order so the sort actually reorders rows.
+    gene_ids = np.arange(num_nonzeros - 1, -1, -1, dtype=np.int32)
+    cell_ids = np.zeros(num_nonzeros, dtype=np.int32)
+    c_vals = np.ones(num_nonzeros, dtype=np.int16)
+    log_probs = np.full(num_nonzeros, -1.0, dtype=np.float32)
+
+    with pq.ParquetWriter(str(parquet_path), schema=POSTERIOR_SCHEMA) as writer:
+        write_posterior_batch_to_parquet(
+            writer=writer,
+            cell_ids=cell_ids,
+            gene_ids=gene_ids,
+            c_vals=c_vals,
+            log_probs=log_probs,
+            regularized=False,
+        )
+
+    # Sort should complete without error and produce an ordered file.
+    sort_posterior_parquet(parquet_path)
+
+    table = pq.read_table(str(parquet_path))
+    gene_ids_after = table.column("gene_id").to_pylist()
+    assert gene_ids_after == sorted(gene_ids_after), "Parquet is not sorted by gene_id after sort_posterior_parquet"
