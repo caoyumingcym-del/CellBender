@@ -31,7 +31,6 @@ from cellbender.remove_background.checkpoint import (
 from cellbender.remove_background.data.dataprep import DataLoader
 from cellbender.remove_background.data.dataprep import prep_sparse_data_for_training as prep_data_for_training
 from cellbender.remove_background.data.dataset import SingleCellRNACountsDataset, get_dataset_obj
-from cellbender.remove_background.data.io import write_matrix_to_cellranger_h5
 from cellbender.remove_background.estimation import MAP, Mean, MultipleChoiceKnapsack, SingleSample, ThresholdCDF
 from cellbender.remove_background.exceptions import ElboException
 from cellbender.remove_background.model import RemoveBackgroundPyroModel
@@ -286,9 +285,10 @@ def compute_output_denoised_counts_reports_metrics(
         cell_counts = csr_set_rows_to_zero(csr=count_matrix, row_inds=empty_inds)
 
         assert posterior.posterior_path is not None, "Posterior must be computed before MCKP target estimation."
+        assert posterior.n_genes is not None, "Posterior must have n_genes set before MCKP target estimation."
         noise_target_fun_per_cell = compute_mean_target_removal_as_function(
             noise_count_posterior_coo=posterior.posterior_path,
-            index_converter=posterior.index_converter,
+            n_genes=posterior.n_genes,
             raw_count_csr_for_cells=cell_counts,
             n_cells=len(cell_inds),
             device="cuda" if args.use_cuda else "cpu",  # TODO check this
@@ -322,7 +322,8 @@ def compute_output_denoised_counts_reports_metrics(
         total_denoised_counts: Optional[float] = None
 
         logger.info(f"Computing denoised counts using {args.estimator} estimator (streaming)")
-        estimator_obj = estimator(index_converter=posterior.index_converter)
+        assert posterior.n_cells is not None and posterior.n_genes is not None  # mypy
+        estimator_obj = estimator(n_cells=posterior.n_cells, n_genes=posterior.n_genes)
         full_ok, filt_ok, total_denoised_counts = _write_streaming_denoised_outputs(
             posterior=posterior,
             estimator_obj=estimator_obj,

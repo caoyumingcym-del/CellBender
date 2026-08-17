@@ -18,12 +18,8 @@ from cellbender.remove_background.estimation import (
     SingleSample,
     ThresholdCDF,
 )
-from cellbender.remove_background.posterior import (
-    IndexConverter,
-    compute_mean_target_removal_as_function,
-    dense_to_sparse_op_torch,
-    log_prob_sparse_to_dense,
-)
+from cellbender.remove_background.posterior import compute_mean_target_removal_as_function
+from cellbender.remove_background.sparse_utils import dense_to_sparse_op_torch, log_prob_sparse_to_dense
 
 
 @pytest.fixture(scope="module")
@@ -74,22 +70,21 @@ def log_prob_coo_base() -> Dict[str, Union[sp.coo_matrix, np.ndarray]]:
 def log_prob_parquet(log_prob_coo_base, tmp_path_factory) -> Dict[str, Union[Path, np.ndarray, sp.coo_matrix]]:
     """Write the base COO fixture to a parquet file for SQL-path tests.
 
-    Uses IndexConverter(total_n_cells=1, total_n_genes=n) so m == gene_id,
-    matching what the estimator tests use.
+    One cell, n_genes genes: cell_id=0 for all entries, gene_id = COO row value.
     """
     coo = log_prob_coo_base["coo"]
     n_genes = coo.shape[0]
-    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
 
     tmp_dir = tmp_path_factory.mktemp("parquet")
     parquet_path = tmp_dir / "posterior.parquet"
 
-    cell_ids, gene_ids = converter.get_ng_indices(m_inds=coo.row.astype(np.int64))
+    cell_ids = np.zeros(len(coo.row), dtype=np.int32)
+    gene_ids = coo.row.astype(np.int32)
     writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
     write_posterior_batch_to_parquet(
         writer=writer,
-        cell_ids=cell_ids.astype(np.int32),
-        gene_ids=gene_ids.astype(np.int32),
+        cell_ids=cell_ids,
+        gene_ids=gene_ids,
         c_vals=coo.col.astype(np.int16),
         log_probs=coo.data.astype(np.float32),
         regularized=False,
@@ -108,9 +103,7 @@ def log_prob_parquet(log_prob_coo_base, tmp_path_factory) -> Dict[str, Union[Pat
 def _read_noise_parquet(path: Path) -> np.ndarray:
     """Read (cell_id, gene_id, noise_count) parquet and return flat noise_count array indexed by gene_id.
     Assumes a single-cell (cell_id=0) result and returns a 1-D array over gene_ids."""
-    df = duckdb.connect().execute(
-        f"SELECT gene_id, noise_count FROM read_parquet('{path}') ORDER BY gene_id"
-    ).df()
+    df = duckdb.connect().execute(f"SELECT gene_id, noise_count FROM read_parquet('{path}') ORDER BY gene_id").df()
     if len(df) == 0:
         return np.array([])
     max_gene = int(df["gene_id"].max())
@@ -128,14 +121,13 @@ def test_map_from_parquet(log_prob_parquet, tmp_path):
     """MAP from parquet path (SQL argmax) matches known truth."""
     path = log_prob_parquet["path"]
     n_genes = log_prob_parquet["n_genes"]
-    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
-    estimator = MAP(index_converter=converter)
+    estimator = MAP(n_cells=1, n_genes=n_genes)
     output = tmp_path / "noise.parquet"
     estimator.estimate_noise_to_parquet(path, output)
     out_per_m = _read_noise_parquet(output)
     # Pad to n_genes in case zero-count genes are absent
     result = np.zeros(n_genes)
-    result[:len(out_per_m)] = out_per_m
+    result[: len(out_per_m)] = out_per_m
     np.testing.assert_array_equal(result, log_prob_parquet["maps"])
 
 
@@ -144,13 +136,12 @@ def test_mean_from_parquet(log_prob_parquet, tmp_path):
     path = log_prob_parquet["path"]
     n_genes = log_prob_parquet["n_genes"]
     coo = log_prob_parquet["coo"]
-    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
-    estimator = Mean(index_converter=converter)
+    estimator = Mean(n_cells=1, n_genes=n_genes)
     output = tmp_path / "noise.parquet"
     estimator.estimate_noise_to_parquet(path, output)
     out_per_m = _read_noise_parquet(output)
     result = np.zeros(n_genes)
-    result[:len(out_per_m)] = out_per_m
+    result[: len(out_per_m)] = out_per_m
 
     dense = log_prob_sparse_to_dense(coo)
     brute_force = np.matmul(np.arange(dense.shape[1]), np.exp(dense).T)
@@ -162,13 +153,12 @@ def test_cdf_from_parquet(log_prob_parquet, tmp_path):
     """ThresholdCDF from parquet path (SQL window cumsum) matches known truth."""
     path = log_prob_parquet["path"]
     n_genes = log_prob_parquet["n_genes"]
-    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
-    estimator = ThresholdCDF(index_converter=converter)
+    estimator = ThresholdCDF(n_cells=1, n_genes=n_genes)
     output = tmp_path / "noise.parquet"
     estimator.estimate_noise_to_parquet(path, output, q=0.5)
     out_per_m = _read_noise_parquet(output)
     result = np.zeros(n_genes)
-    result[:len(out_per_m)] = out_per_m
+    result[: len(out_per_m)] = out_per_m
     np.testing.assert_array_equal(result, log_prob_parquet["cdfs"])
 
 
@@ -177,8 +167,7 @@ def test_single_sample_from_parquet(log_prob_parquet, tmp_path):
     path = log_prob_parquet["path"]
     n_genes = log_prob_parquet["n_genes"]
     coo = log_prob_parquet["coo"]
-    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
-    estimator = SingleSample(index_converter=converter)
+    estimator = SingleSample(n_cells=1, n_genes=n_genes)
     output = tmp_path / "noise.parquet"
     estimator.estimate_noise_to_parquet(path, output)
     out_per_m = _read_noise_parquet(output)
@@ -215,12 +204,9 @@ def test_cdf_parquet_coalesce_fallback(tmp_path_factory):
     )
     writer.close()
 
-    converter = IndexConverter(total_n_cells=1, total_n_genes=1)
-    estimator = ThresholdCDF(index_converter=converter)
+    estimator = ThresholdCDF(n_cells=1, n_genes=1)
     estimator.estimate_noise_to_parquet(parquet_path, output_path, q=0.9)
-    result = duckdb.connect().execute(
-        f"SELECT noise_count FROM read_parquet('{output_path}')"
-    ).fetchone()[0]
+    result = duckdb.connect().execute(f"SELECT noise_count FROM read_parquet('{output_path}')").fetchone()[0]
     assert result == 10
 
 
@@ -244,11 +230,8 @@ def test_mean_parquet_numerical_stability(tmp_path_factory):
     )
     writer.close()
 
-    converter = IndexConverter(total_n_cells=1, total_n_genes=1)
-    Mean(index_converter=converter).estimate_noise_to_parquet(parquet_path, output_path)
-    result = duckdb.connect().execute(
-        f"SELECT noise_count FROM read_parquet('{output_path}')"
-    ).fetchone()[0]
+    Mean(n_cells=1, n_genes=1).estimate_noise_to_parquet(parquet_path, output_path)
+    result = duckdb.connect().execute(f"SELECT noise_count FROM read_parquet('{output_path}')").fetchone()[0]
 
     assert np.isfinite(result), "Mean returned NaN/Inf for extreme log_probs"
     denom = 1.0 + np.exp(-1.0)
@@ -260,13 +243,11 @@ def test_compute_mean_target_removal_from_parquet(log_prob_parquet):
     """compute_mean_target_removal_as_function accepts a parquet Path."""
     path = log_prob_parquet["path"]
     n_genes = log_prob_parquet["n_genes"]
-    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
-
     raw_counts = sp.csr_matrix(np.ones((1, n_genes), dtype=np.float32))
 
     target_fun = compute_mean_target_removal_as_function(
         noise_count_posterior_coo=path,
-        index_converter=converter,
+        n_genes=n_genes,
         raw_count_csr_for_cells=raw_counts,
         n_cells=1,
         device="cpu",
@@ -287,6 +268,7 @@ def mckp_parquet(log_prob_coo_base, tmp_path_factory) -> Dict:
     """Write the base COO (minus empty row 0) to parquet for MCKP tests.
 
     Row 0 in log_prob_coo_base is empty; MCKP needs a clean 1-cell / n_genes layout.
+    One cell, n_genes genes: cell_id=0 for all entries, gene_id = re-indexed row value.
     """
     coo = log_prob_coo_base["coo"]
     # Drop the empty row 0 and re-index rows to 0-based
@@ -297,16 +279,16 @@ def mckp_parquet(log_prob_coo_base, tmp_path_factory) -> Dict:
     n_genes = coo.shape[0] - 1  # original shape[0] was 9 (8 rows + 1 empty)
     new_coo = sp.coo_matrix((new_data, (new_row, new_col)), shape=(n_genes, coo.shape[1]))
 
-    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
     tmp_dir = tmp_path_factory.mktemp("mckp_parquet")
     parquet_path = tmp_dir / "posterior.parquet"
 
-    cell_ids, gene_ids = converter.get_ng_indices(m_inds=new_coo.row.astype(np.int64))
+    cell_ids = np.zeros(len(new_coo.row), dtype=np.int32)
+    gene_ids = new_coo.row.astype(np.int32)
     writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
     write_posterior_batch_to_parquet(
         writer=writer,
-        cell_ids=cell_ids.astype(np.int32),
-        gene_ids=gene_ids.astype(np.int32),
+        cell_ids=cell_ids,
+        gene_ids=gene_ids,
         c_vals=new_coo.col.astype(np.int16),
         log_probs=new_data.astype(np.float32),
         regularized=False,
@@ -329,14 +311,11 @@ def test_mckp_from_parquet(mckp_parquet, target, truth, tmp_path):
     """MCKP from parquet produces correct per-gene totals."""
     path = mckp_parquet["path"]
     n_genes = mckp_parquet["n_genes"]
-    converter = IndexConverter(total_n_cells=1, total_n_genes=n_genes)
-    estimator = MultipleChoiceKnapsack(index_converter=converter)
+    estimator = MultipleChoiceKnapsack(n_cells=1, n_genes=n_genes)
     output = tmp_path / "noise.parquet"
     estimator.estimate_noise_to_parquet(path, output, noise_targets_per_gene=target)
 
-    df = duckdb.connect().execute(
-        f"SELECT gene_id, noise_count FROM read_parquet('{output}') ORDER BY gene_id"
-    ).df()
+    df = duckdb.connect().execute(f"SELECT gene_id, noise_count FROM read_parquet('{output}') ORDER BY gene_id").df()
     out_per_gene = np.zeros(n_genes)
     out_per_gene[df["gene_id"].values] = df["noise_count"].values
     np.testing.assert_array_equal(out_per_gene, truth)

@@ -5,10 +5,7 @@ import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Tuple
-
-if TYPE_CHECKING:
-    from cellbender.remove_background.posterior import IndexConverter
+from typing import Optional, Tuple
 
 import duckdb
 import numpy as np
@@ -23,8 +20,9 @@ COUNT_DATATYPE = np.int32
 class EstimationMethod(ABC):
     """Base class for estimation of noise counts, given a posterior."""
 
-    def __init__(self, index_converter: "IndexConverter"):
-        self.index_converter = index_converter
+    def __init__(self, n_cells: int, n_genes: int):
+        self.n_cells = n_cells
+        self.n_genes = n_genes
         super(EstimationMethod, self).__init__()
 
     @abstractmethod
@@ -225,7 +223,7 @@ def _estimate_via_sql_to_parquet(
 
 def estimate_mean_noise_per_gene(
     source: Path,
-    index_converter: "IndexConverter",
+    n_genes: int,
     duckdb_memory_limit: Optional[str] = None,
 ) -> np.ndarray:
     """Return total E[noise_count] per gene, summed over all cells.
@@ -235,12 +233,12 @@ def estimate_mean_noise_per_gene(
 
     Args:
         source: Path to posterior parquet.
-        index_converter: Determines output array length (``total_n_genes``).
+        n_genes: Total number of genes; determines output array length.
         duckdb_memory_limit: DuckDB memory cap (e.g. ``'4GB'``).  When
             *None*, DuckDB auto-detects (~80 % of system RAM).
 
     Returns:
-        mean_noise_per_gene: 1-D array of shape ``(total_n_genes,)`` where
+        mean_noise_per_gene: 1-D array of shape ``(n_genes,)`` where
             entry *g* is ``sum_over_cells(E[noise_count(cell, g)])``.
     """
     query = """
@@ -274,7 +272,7 @@ def estimate_mean_noise_per_gene(
         conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
     _register_posterior(conn, source)
     df = conn.execute(query).df()
-    result = np.zeros(index_converter.total_n_genes, dtype=np.float64)
+    result = np.zeros(n_genes, dtype=np.float64)
     if len(df) > 0:
         result[df["gene_id"].values.astype(np.int32)] = df["total_mean_noise"].values
     return result
@@ -342,7 +340,7 @@ class MultipleChoiceKnapsack(EstimationMethod):
             cell_ids=map_df["cell_id"].values,
             gene_ids=map_df["gene_id"].values,
             data=map_df["map_c"].values.astype(COUNT_DATATYPE),
-            shape=self.index_converter.matrix_shape,
+            shape=(self.n_cells, self.n_genes),
         )
         map_noise_per_gene = np.asarray(map_csr.sum(axis=0)).squeeze()
         del map_csr
@@ -352,7 +350,7 @@ class MultipleChoiceKnapsack(EstimationMethod):
 
         gene_targets_df = pd.DataFrame(
             {
-                "gene_id": np.arange(self.index_converter.total_n_genes, dtype=np.int32),
+                "gene_id": np.arange(self.n_genes, dtype=np.int32),
                 "step_direction": step_dir,
                 "topk": topk,
             }

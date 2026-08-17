@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, Union, cast
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple, cast
 
 import pyarrow.parquet as pq
 
@@ -40,7 +40,6 @@ from cellbender.remove_background.estimation import estimate_mean_noise_per_gene
 from cellbender.remove_background.model import calculate_lambda, calculate_mu
 from cellbender.remove_background.sparse_utils import (
     dense_to_sparse_op_torch,
-    log_prob_sparse_to_dense,
 )
 
 logger = logging.getLogger("cellbender")
@@ -64,7 +63,6 @@ def _posterior_global_latents_path(parquet_path: Path) -> Path:
     else:
         new_name = parquet_path.stem + "_global_latents.json"
     return parquet_path.parent / new_name
-
 
 
 def _checkpoint_assertion(tarball: str) -> None:
@@ -268,10 +266,11 @@ class Posterior:
         self._latents: Dict[str, np.ndarray] | None = None
         self._model_loss: dict = {}
         if dataset_obj is not None and dataset_obj.data is not None:
-            self.index_converter = IndexConverter(
-                total_n_cells=dataset_obj.data["matrix"].shape[0],
-                total_n_genes=dataset_obj.data["matrix"].shape[1],
-            )
+            self.n_cells: int | None = dataset_obj.data["matrix"].shape[0]
+            self.n_genes: int | None = dataset_obj.data["matrix"].shape[1]
+        else:
+            self.n_cells = None
+            self.n_genes = None
 
     def save(self, file: str) -> bool:
         """Save the posterior parquet to *file* and copy the latents CSV sidecar."""
@@ -901,65 +900,9 @@ class Posterior:
         return {"mu": mu_map, "lam": lambda_map, "alpha": alpha_map}
 
 
-class IndexConverter:
-    def __init__(self, total_n_cells: int, total_n_genes: int):
-        """Convert between (n, g) indices and flattened 'm' indices
-
-        Args:
-            total_n_cells: Total rows in the full sparse matrix
-            total_n_genes: Total columns in the full sparse matrix
-
-        """
-        self.total_n_cells = total_n_cells
-        self.total_n_genes = total_n_genes
-        self.matrix_shape = (total_n_cells, total_n_genes)
-
-    def __repr__(self):
-        return (
-            f"IndexConverter with"
-            f"\n\ttotal_n_cells: {self.total_n_cells}"
-            f"\n\ttotal_n_genes: {self.total_n_genes}"
-            f"\n\tmatrix_shape: {self.matrix_shape}"
-        )
-
-    def get_m_indices(
-        self, cell_inds: Union[np.ndarray, torch.Tensor], gene_inds: Union[np.ndarray, torch.Tensor]
-    ) -> Union[np.ndarray, torch.Tensor]:
-        """Given arrays of cell indices and gene indices, suitable for a sparse matrix,
-        convert them to 'm' index values.
-        """
-        if not ((cell_inds >= 0) & (cell_inds < self.total_n_cells)).all():
-            raise ValueError(
-                f"Requested cell_inds out of range: {cell_inds[(cell_inds < 0) | (cell_inds >= self.total_n_cells)]}"
-            )
-        if not ((gene_inds >= 0) & (gene_inds < self.total_n_genes)).all():
-            raise ValueError(
-                f"Requested gene_inds out of range: {gene_inds[(gene_inds < 0) | (gene_inds >= self.total_n_genes)]}"
-            )
-        if isinstance(cell_inds, np.ndarray):
-            assert isinstance(gene_inds, np.ndarray)
-            return cell_inds.astype(np.uint64) * self.total_n_genes + gene_inds.astype(np.uint64)
-        elif isinstance(cell_inds, torch.Tensor):
-            assert isinstance(gene_inds, torch.Tensor)
-            return cell_inds.type(torch.int64) * self.total_n_genes + gene_inds.type(torch.int64)
-        else:
-            raise ValueError("IndexConverter.get_m_indices received cell_inds of unkown object type")
-
-    def get_ng_indices(self, m_inds: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Given a list of 'm' index values, return two arrays: cell index values
-        and gene index values, suitable for a sparse matrix.
-        """
-        if not ((m_inds >= 0) & (m_inds < self.total_n_cells * self.total_n_genes)).all():
-            raise ValueError(
-                f"Requested m_inds out of range: "
-                f"{m_inds[(m_inds < 0) | (m_inds >= self.total_n_cells * self.total_n_genes)]}"
-            )
-        return np.divmod(m_inds, self.total_n_genes)
-
-
 def compute_mean_target_removal_as_function(
     noise_count_posterior_coo: Path,
-    index_converter: IndexConverter,
+    n_genes: int,
     raw_count_csr_for_cells: sp.csr_matrix,
     n_cells: int,
     device: str,
@@ -975,7 +918,7 @@ def compute_mean_target_removal_as_function(
 
     Args:
         noise_count_posterior_coo: Path to the posterior parquet file.
-        index_converter: IndexConverter object from 'm' to (n, g) and back
+        n_genes: Total number of genes; determines output array length.
         raw_count_csr_for_cells: The input count matrix for only the cells
             included in the posterior
         n_cells: Number of cells included in the posterior, same number as in
@@ -995,7 +938,7 @@ def compute_mean_target_removal_as_function(
     logger.debug("Computing per-gene mean noise totals...")
     mean_noise_per_gene = estimate_mean_noise_per_gene(
         source=noise_count_posterior_coo,
-        index_converter=index_converter,
+        n_genes=n_genes,
         duckdb_memory_limit=duckdb_memory_limit,
     )
     mean_noise_total = float(mean_noise_per_gene.sum())
@@ -1021,102 +964,6 @@ def compute_mean_target_removal_as_function(
         return torch.tensor(target / n_cells).to(device)
 
     return _target_fun
-
-
-@torch.no_grad()
-def torch_binary_search(
-    evaluate_outcome_given_value: Callable[[torch.Tensor], torch.Tensor],
-    target_outcome: torch.Tensor,
-    init_range: torch.Tensor,
-    target_tolerance: float = 0.001,
-    max_iterations: int = consts.POSTERIOR_REG_SEARCH_MAX_ITER,
-    debug: bool = False,
-) -> torch.Tensor:
-    """Perform a binary search, given a target and an evaluation function.
-
-    NOTE: evaluate_outcome_given_value(value) should increase monotonically
-    with the input value. It is assumed that
-    consts.POSTERIOR_REG_MIN < output_value < consts.POSTERIOR_REG_MAX.
-    If this is not the case, the algorithm will produce an output close to one
-    of those endpoints, and target_tolerance will not be achieved.
-    Moreover, output_value must be positive (due to how we search for limits).
-
-    Args:
-        evaluate_outcome_given_value: Function that takes a value as its
-            input and produces the outcome, which is the target we are
-            trying to control. Should increase monotonically with value.
-        target_outcome: Desired outcome value from evaluate_outcome_given_value(value).
-        init_range: Search range, for each value.
-        target_tolerance: Tolerated error in the target value.
-        max_iterations: A cutoff to ensure termination. Even if a tolerable
-            solution is not found, the algorithm will stop after this many
-            iterations and return the best answer so far.
-        debug: Print debugging messages.
-
-    Returns:
-        value: Result of binary search. Same shape as init_value.
-
-    """
-
-    logger.debug("Binary search commencing")
-
-    assert target_tolerance > 0, "target_tolerance should be > 0."
-    assert len(init_range.shape) > 1, (
-        "init_range must be at least two-dimensional (last dimension contains lower and upper bounds)"
-    )
-    assert init_range.shape[-1] == 2, "Last dimension of init_range should be 2: low and high"
-
-    value_bracket = init_range.clone()
-
-    # Binary search algorithm.
-    for i in range(max_iterations):
-        logger.debug(
-            f"Binary search limits [batch_dim=0, :]: {value_bracket.reshape(-1, value_bracket.shape[-1])[0, :]}"
-        )
-
-        # Current test value.
-        value = value_bracket.mean(dim=-1)
-
-        # Calculate an expected false positive rate for this lam_mult value.
-        outcome = evaluate_outcome_given_value(value)
-        residual = target_outcome - outcome
-
-        # Check on residual and update our bracket values.
-        stop_condition = (residual.abs() < target_tolerance).all()
-        if stop_condition:
-            break
-        else:
-            value_bracket[..., 0] = torch.where(
-                outcome < target_outcome - target_tolerance, value, value_bracket[..., 0]
-            )
-            value_bracket[..., 1] = torch.where(
-                outcome > target_outcome + target_tolerance, value, value_bracket[..., 1]
-            )
-
-    # If we stopped due to iteration limit, take the average value.
-    if i == max_iterations:
-        value = value_bracket.mean(dim=-1)
-        logger.warning(
-            f"Binary search target not achieved in {max_iterations} attempts. "
-            f"Output is estimated to be {outcome.mean().item():.4f}"
-        )
-
-    # Warn if we railed out at the limits of the search
-    if debug:
-        if (value - target_tolerance <= init_range[..., 0]).sum() > 0:
-            logger.debug(
-                f"{(value - target_tolerance <= init_range[..., 0]).sum()} "
-                f"entries in the binary search hit the lower limit"
-            )
-            logger.debug(value[value - target_tolerance <= init_range[..., 0]])
-        if (value + target_tolerance >= init_range[..., 1]).sum() > 0:
-            logger.debug(
-                f"{(value + target_tolerance >= init_range[..., 1]).sum()} "
-                f"entries in the binary search hit the upper limit"
-            )
-            logger.debug(value[value + target_tolerance >= init_range[..., 1]])
-
-    return value
 
 
 def restore_from_checkpoint(

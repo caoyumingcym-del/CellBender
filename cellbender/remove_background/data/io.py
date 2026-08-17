@@ -6,7 +6,7 @@ import os
 import gzip
 import traceback
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import anndata
 import numpy as np
@@ -23,8 +23,6 @@ import logging
 import os
 import gzip
 import traceback
-if TYPE_CHECKING:
-    from cellbender.remove_background.posterior import IndexConverter
 
 
 logger = logging.getLogger('cellbender')
@@ -283,46 +281,6 @@ def sort_posterior_parquet(path: Path, duckdb_memory_limit: "Optional[str]" = No
         f"TO '{tmp_str}' (FORMAT PARQUET, COMPRESSION 'snappy')"
     )
     tmp.rename(path)
-
-
-def _parquet_to_coo(
-        path: Path,
-        index_converter: "IndexConverter",
-        regularized: bool = False) -> sp.coo_matrix:
-    """Load posterior parquet rows into an m-indexed (m, c) COO matrix.
-
-    The 'c' column stores absolute noise counts (no separate offset needed).
-
-    Args:
-        path: Path to the posterior parquet file.
-        index_converter: Used to compute m = cell_id * n_genes + gene_id.
-        regularized: If True, load the regularized rows; otherwise the main posterior.
-
-    Returns:
-        coo: Sparse COO matrix with rows=m-index, cols=absolute noise count.
-    """
-    import pandas as pd
-    table = pq.read_table(str(path), filters=[('regularized', '==', regularized)])
-    df = table.to_pandas()
-
-    if len(df) == 0:
-        n_rows = index_converter.total_n_cells * index_converter.total_n_genes
-        return sp.coo_matrix((n_rows, 1), dtype=np.float64)
-
-    cell_ids = df['cell_id'].values.astype(np.int64)
-    gene_ids = df['gene_id'].values.astype(np.int64)
-    c_vals   = df['c'].values.astype(np.int32)
-    log_probs = df['log_prob'].values.astype(np.float64)
-
-    m = index_converter.get_m_indices(cell_inds=cell_ids, gene_inds=gene_ids)
-
-    n_rows = int(index_converter.total_n_cells) * int(index_converter.total_n_genes)
-    n_cols = int(c_vals.max()) + 1 if len(c_vals) > 0 else 1
-
-    return sp.coo_matrix(
-        (log_probs, (m, c_vals)),
-        shape=(n_rows, n_cols),
-    )
 
 
 class IncrementalH5Writer:

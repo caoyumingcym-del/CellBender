@@ -10,88 +10,14 @@ import torch
 
 from cellbender.remove_background.data.io import POSTERIOR_SCHEMA, write_posterior_batch_to_parquet
 from cellbender.remove_background.posterior import (
-    IndexConverter,
     Posterior,
     compute_mean_target_removal_as_function,
-    torch_binary_search,
 )
-
-USE_CUDA = torch.cuda.is_available()
 
 
 @pytest.mark.skip
 def test_create_posterior():
     pass
-
-
-def test_index_converter():
-    index_converter = IndexConverter(total_n_cells=10, total_n_genes=5)
-    print(index_converter)
-
-    # check basic conversion
-    n = np.array([0, 1, 2, 3])
-    g = n.copy()
-    m = index_converter.get_m_indices(cell_inds=n, gene_inds=g)
-    print(f"m inds are {m}")
-    truth = 5 * n + g
-    print(f"expected {truth}")
-    np.testing.assert_equal(m, truth)
-
-    # back and forth
-    n_star, g_star = index_converter.get_ng_indices(m_inds=m)
-    np.testing.assert_equal(n, n_star)
-    np.testing.assert_equal(g, g_star)
-
-    # check on input validity checking
-    with pytest.raises(ValueError):
-        index_converter.get_m_indices(cell_inds=np.array([-1]), gene_inds=g)
-    with pytest.raises(ValueError):
-        index_converter.get_m_indices(cell_inds=np.array([10]), gene_inds=g)
-    with pytest.raises(ValueError):
-        index_converter.get_m_indices(cell_inds=n, gene_inds=np.array([-1]))
-    with pytest.raises(ValueError):
-        index_converter.get_m_indices(cell_inds=n, gene_inds=np.array([5]))
-    with pytest.raises(ValueError):
-        index_converter.get_ng_indices(m_inds=np.array([-1]))
-    with pytest.raises(ValueError):
-        index_converter.get_ng_indices(m_inds=np.array([10 * 5]))
-
-
-def test_torch_binary_search():
-    """Test the general binary search function."""
-
-    tol = 0.001
-
-    def fun1(x):
-        return x - 1.0
-
-    out = torch_binary_search(
-        evaluate_outcome_given_value=fun1,
-        target_outcome=torch.tensor([0.0]),
-        init_range=torch.tensor([[0.0, 10.0]]),
-        target_tolerance=tol,
-    )
-    print("Single value binary search")
-    print("Target value = [1.]")
-    print(f"Output = {out}")
-    assert ((out - torch.tensor([1.0])).abs() <= tol).all(), "Single input binary search failed"
-
-    def fun2(x):
-        x = x.clone()
-        x[0] = x[0] - 1.0
-        x[1] = x[1] - 2.0
-        return x
-
-    out = torch_binary_search(
-        evaluate_outcome_given_value=fun2,
-        target_outcome=torch.tensor([0.0, 0.0]),
-        init_range=torch.tensor([[-10.0, 5.0], [0.0, 10.0]]),
-        target_tolerance=tol,
-    )
-    print("Two-value binary search")
-    print("Target value = [1., 2.]")
-    print(f"Output = {out}")
-    assert ((out - torch.tensor([1.0, 2.0])).abs() <= tol).all(), "Two-argument input binary search failed"
 
 
 @pytest.mark.parametrize("fpr", [0.0, 0.1, 0.5, 0.75, 1], ids=lambda a: f"fpr{a}")
@@ -105,10 +31,11 @@ def test_compute_mean_target_removal_as_function(tmp_path, fpr, per_gene):
     n = -np.inf
     m = np.array(
         [
-            [0, n, n, n, n, n, n, n],   # cell 1: MAP 0
-            [n, 0, n, n, n, n, n, n],   # cell 2: MAP 1 (1 raw count)
+            [0, n, n, n, n, n, n, n],  # cell 1: MAP 0
+            [n, 0, n, n, n, n, n, n],  # cell 2: MAP 1 (1 raw count)
             [-0.3, -1.5, np.log(1.0 - np.exp(np.array([-0.3, -1.5])).sum())] + [n] * 5,  # cell 3: 2 raw counts
-            [-3, -1.21, -0.7, -2, -4, np.log(1.0 - np.exp(np.array([-3, -1.21, -0.7, -2, -4])).sum())] + [n] * 2,  # cell 4: 5 raw
+            [-3, -1.21, -0.7, -2, -4, np.log(1.0 - np.exp(np.array([-3, -1.21, -0.7, -2, -4])).sum())]
+            + [n] * 2,  # cell 4: 5 raw
         ]
     )
     # Only cells 1-4 have posterior entries (skip empty cell 0).
@@ -139,12 +66,11 @@ def test_compute_mean_target_removal_as_function(tmp_path, fpr, per_gene):
 
     # n_cells=5 total, 1 gene; count_matrix reflects the raw counts above.
     n_cells = 5
-    index_converter = IndexConverter(total_n_cells=n_cells, total_n_genes=1)
     count_matrix = sp.csr_matrix(np.expand_dims(np.array([0, 0, 1, 2, 5]), axis=-1))
 
     target_fun = compute_mean_target_removal_as_function(
         noise_count_posterior_coo=parquet_path,
-        index_converter=index_converter,
+        n_genes=1,
         raw_count_csr_for_cells=count_matrix,
         n_cells=n_cells,
         device="cpu",
