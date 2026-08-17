@@ -238,7 +238,7 @@ def write_matrix_to_cellranger_h5(
 POSTERIOR_SCHEMA = pa.schema([
     pa.field('cell_id',     pa.int32()),
     pa.field('gene_id',     pa.int32()),
-    pa.field('c',           pa.int16()),
+    pa.field('c',           pa.int32()),
     pa.field('log_prob',    pa.float32()),
     pa.field('regularized', pa.bool_()),
 ])
@@ -256,7 +256,7 @@ def write_posterior_batch_to_parquet(
     batch = pa.table({
         'cell_id':     pa.array(cell_ids.astype(np.int32),   type=pa.int32()),
         'gene_id':     pa.array(gene_ids.astype(np.int32),   type=pa.int32()),
-        'c':           pa.array(c_vals.astype(np.int16),     type=pa.int16()),
+        'c':           pa.array(c_vals.astype(np.int32),     type=pa.int32()),
         'log_prob':    pa.array(log_probs.astype(np.float32), type=pa.float32()),
         'regularized': pa.array(np.full(n, regularized, dtype=bool), type=pa.bool_()),
     })

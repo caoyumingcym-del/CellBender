@@ -85,7 +85,7 @@ def log_prob_parquet(log_prob_coo_base, tmp_path_factory) -> Dict[str, Union[Pat
         writer=writer,
         cell_ids=cell_ids,
         gene_ids=gene_ids,
-        c_vals=coo.col.astype(np.int16),
+        c_vals=coo.col.astype(np.int32),
         log_probs=coo.data.astype(np.float32),
         regularized=False,
     )
@@ -198,7 +198,7 @@ def test_cdf_parquet_coalesce_fallback(tmp_path_factory):
         writer=writer,
         cell_ids=np.array([0, 0], dtype=np.int32),
         gene_ids=np.array([0, 0], dtype=np.int32),
-        c_vals=np.array([5, 10], dtype=np.int16),
+        c_vals=np.array([5, 10], dtype=np.int32),
         log_probs=np.array([log_prob, log_prob], dtype=np.float32),
         regularized=False,
     )
@@ -216,7 +216,7 @@ def test_mean_parquet_numerical_stability(tmp_path_factory):
     parquet_path = tmp_dir / "posterior.parquet"
     output_path = tmp_dir / "noise.parquet"
 
-    cs = np.array([3, 5], dtype=np.int16)
+    cs = np.array([3, 5], dtype=np.int32)
     log_probs = np.array([-1000.0, -1001.0], dtype=np.float32)
 
     writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
@@ -289,7 +289,7 @@ def mckp_parquet(log_prob_coo_base, tmp_path_factory) -> Dict:
         writer=writer,
         cell_ids=cell_ids,
         gene_ids=gene_ids,
-        c_vals=new_coo.col.astype(np.int16),
+        c_vals=new_coo.col.astype(np.int32),
         log_probs=new_data.astype(np.float32),
         regularized=False,
     )
@@ -319,3 +319,228 @@ def test_mckp_from_parquet(mckp_parquet, target, truth, tmp_path):
     out_per_gene = np.zeros(n_genes)
     out_per_gene[df["gene_id"].values] = df["noise_count"].values
     np.testing.assert_array_equal(out_per_gene, truth)
+
+
+# ---------------------------------------------------------------------------
+# int32 c-value regression: values that would overflow int16
+# ---------------------------------------------------------------------------
+
+
+def test_c_large_value_no_overflow(tmp_path_factory):
+    """c values > 32767 (former int16 max) must round-trip without corruption.
+
+    In the old int16 schema, c=33000 would silently become -32536.  With int32
+    this must pass: MAP should return 33000, not a corrupted negative value.
+    """
+    tmp_dir = tmp_path_factory.mktemp("c_overflow")
+    parquet_path = tmp_dir / "posterior.parquet"
+    output_path = tmp_dir / "noise.parquet"
+
+    # Two c values for one (cell, gene): 33000 is the MAP (higher log_prob).
+    c_vals = np.array([32767, 33000], dtype=np.int32)
+    log_probs = np.array([-1.0, -0.1], dtype=np.float32)
+
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.zeros(2, dtype=np.int32),
+        gene_ids=np.zeros(2, dtype=np.int32),
+        c_vals=c_vals,
+        log_probs=log_probs,
+        regularized=False,
+    )
+    writer.close()
+
+    MAP(n_cells=1, n_genes=1).estimate_noise_to_parquet(parquet_path, output_path)
+    result = duckdb.connect().execute(f"SELECT noise_count FROM read_parquet('{output_path}')").fetchone()[0]
+    assert result == 33000, f"Expected MAP=33000, got {result} (int16 overflow would give -32536)"
+
+
+# ---------------------------------------------------------------------------
+# MCKP: multi-cell and early-exit
+# ---------------------------------------------------------------------------
+
+
+def test_mckp_multi_cell(tmp_path_factory):
+    """MCKP correctly ranks step candidates across multiple cells.
+
+    3 cells × 2 genes.  Gene 0: MAP per-cell = [0, 1, 2], target total = 2.
+    Gene 1: MAP per-cell = [3, 3, 3], target total = 7 (step down by 2 total).
+    The knapsack must pick the two cells with smallest cost to decrease by 1 each.
+    """
+    tmp_dir = tmp_path_factory.mktemp("mckp_multicell")
+    parquet_path = tmp_dir / "posterior.parquet"
+    output_path = tmp_dir / "noise.parquet"
+
+    # Gene 0: cell 0 → MAP=0 (only c=0); cell 1 → MAP=1 (only c=1);
+    #          cell 2 → MAP=2 (c=1 log=-2, c=2 log=-0.1, c=3 log=-3).
+    # Target total for gene 0 = 2:  MAP total = 0+1+2 = 3, need to step down by 1.
+    # Only cell 2 can step down (has c < MAP).  Expected output: cell 2 → 1.
+    # → per-cell gene-0 noise: [0, 1, 1], sum=2.
+
+    # Gene 1: all cells have c=2 (log=-1) and c=3 (log=-0.1) [MAP=3].
+    # Target total = 7, MAP total = 9, step down by 2.
+    # Each cell can step from 3 to 2; cost = abs(-1 - (-0.1)) = 0.9 for each.
+    # We pick 2 of the 3 cells — any 2 (all equal cost). Expected sum = 7.
+    # → one cell stays at 3, two cells drop to 2.
+
+    cell_ids, gene_ids, c_vals, log_probs = [], [], [], []
+
+    def _add(cell, gene, c_arr, lp_arr):
+        for c, lp in zip(c_arr, lp_arr):
+            cell_ids.append(cell)
+            gene_ids.append(gene)
+            c_vals.append(c)
+            log_probs.append(lp)
+
+    # gene 0
+    _add(0, 0, [0], [0.0])  # MAP=0, can't move
+    _add(1, 0, [1], [0.0])  # MAP=1, can't move
+    _add(2, 0, [1, 2, 3], [-2.0, -0.1, -3.0])  # MAP=2, can step down to 1
+
+    # gene 1
+    for cell in range(3):
+        _add(cell, 1, [2, 3], [-1.0, -0.1])  # MAP=3 for all
+
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.array(cell_ids, dtype=np.int32),
+        gene_ids=np.array(gene_ids, dtype=np.int32),
+        c_vals=np.array(c_vals, dtype=np.int32),
+        log_probs=np.array(log_probs, dtype=np.float32),
+        regularized=False,
+    )
+    writer.close()
+
+    targets = np.array([2.0, 7.0])
+    estimator = MultipleChoiceKnapsack(n_cells=3, n_genes=2)
+    estimator.estimate_noise_to_parquet(parquet_path, output_path, noise_targets_per_gene=targets)
+
+    df = (
+        duckdb.connect()
+        .execute(
+            f"SELECT gene_id, SUM(noise_count) AS total "
+            f"FROM read_parquet('{output_path}') GROUP BY gene_id ORDER BY gene_id"
+        )
+        .df()
+    )
+    totals = {int(row.gene_id): int(row.total) for row in df.itertuples()}
+
+    assert totals[0] == 2, f"Gene 0 total should be 2, got {totals[0]}"
+    assert totals[1] == 7, f"Gene 1 total should be 7, got {totals[1]}"
+
+
+def test_mckp_early_exit_when_map_matches_targets(tmp_path_factory):
+    """When MAP totals already equal all targets, the early-exit path is taken."""
+    tmp_dir = tmp_path_factory.mktemp("mckp_early")
+    parquet_path = tmp_dir / "posterior.parquet"
+    output_path = tmp_dir / "noise.parquet"
+
+    # 2 genes, 1 cell: MAP = [3, 5].  Targets = [3.0, 5.0] → no adjustment needed.
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.zeros(4, dtype=np.int32),
+        gene_ids=np.array([0, 0, 1, 1], dtype=np.int32),
+        c_vals=np.array([2, 3, 4, 5], dtype=np.int32),
+        log_probs=np.array([-1.0, -0.1, -1.0, -0.1], dtype=np.float32),
+        regularized=False,
+    )
+    writer.close()
+
+    targets = np.array([3.0, 5.0])
+    estimator = MultipleChoiceKnapsack(n_cells=1, n_genes=2)
+    estimator.estimate_noise_to_parquet(parquet_path, output_path, noise_targets_per_gene=targets)
+
+    df = (
+        duckdb.connect()
+        .execute(f"SELECT gene_id, noise_count FROM read_parquet('{output_path}') ORDER BY gene_id")
+        .df()
+    )
+    assert list(df["noise_count"]) == [3, 5], f"Expected [3, 5], got {list(df['noise_count'])}"
+
+
+# ---------------------------------------------------------------------------
+# ThresholdCDF boundary q values
+# ---------------------------------------------------------------------------
+
+
+def test_cdf_q_zero(tmp_path_factory):
+    """q=0.0 returns the minimum c in the stored posterior window."""
+    tmp_dir = tmp_path_factory.mktemp("cdf_q0")
+    parquet_path = tmp_dir / "posterior.parquet"
+    output_path = tmp_dir / "noise.parquet"
+
+    # c values 5, 10, 15 with most mass at c=15.  q=0 → min c = 5.
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.zeros(3, dtype=np.int32),
+        gene_ids=np.zeros(3, dtype=np.int32),
+        c_vals=np.array([5, 10, 15], dtype=np.int32),
+        log_probs=np.array([-3.0, -2.0, -0.1], dtype=np.float32),
+        regularized=False,
+    )
+    writer.close()
+
+    ThresholdCDF(n_cells=1, n_genes=1).estimate_noise_to_parquet(parquet_path, output_path, q=0.0)
+    result = duckdb.connect().execute(f"SELECT noise_count FROM read_parquet('{output_path}')").fetchone()[0]
+    assert result == 5, f"q=0.0 should return minimum c=5, got {result}"
+
+
+def test_cdf_q_one(tmp_path_factory):
+    """q=1.0 triggers the COALESCE fallback and returns the maximum c."""
+    tmp_dir = tmp_path_factory.mktemp("cdf_q1")
+    parquet_path = tmp_dir / "posterior.parquet"
+    output_path = tmp_dir / "noise.parquet"
+
+    # Three entries that sum to < 1.0 (windowed posterior).  q=1.0 → COALESCE → max c.
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.zeros(3, dtype=np.int32),
+        gene_ids=np.zeros(3, dtype=np.int32),
+        c_vals=np.array([5, 10, 15], dtype=np.int32),
+        log_probs=np.array([-3.0, -2.0, -0.1], dtype=np.float32),
+        regularized=False,
+    )
+    writer.close()
+
+    ThresholdCDF(n_cells=1, n_genes=1).estimate_noise_to_parquet(parquet_path, output_path, q=1.0)
+    result = duckdb.connect().execute(f"SELECT noise_count FROM read_parquet('{output_path}')").fetchone()[0]
+    assert result == 15, f"q=1.0 should return maximum c=15 via COALESCE, got {result}"
+
+
+# ---------------------------------------------------------------------------
+# Gene absent from posterior → absent from estimation output
+# ---------------------------------------------------------------------------
+
+
+def test_gene_absent_from_posterior_is_absent_from_output(tmp_path_factory):
+    """A gene with no posterior entries should not appear in the estimation output.
+
+    Downstream code treats missing genes as 0 noise.  This test confirms the
+    contract: absent gene → absent row (not a zero row).
+    """
+    tmp_dir = tmp_path_factory.mktemp("absent_gene")
+    parquet_path = tmp_dir / "posterior.parquet"
+    output_path = tmp_dir / "noise.parquet"
+
+    # Only gene 0 has posterior entries; gene 1 is absent.
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.zeros(2, dtype=np.int32),
+        gene_ids=np.zeros(2, dtype=np.int32),
+        c_vals=np.array([0, 1], dtype=np.int32),
+        log_probs=np.array([-0.5, -1.0], dtype=np.float32),
+        regularized=False,
+    )
+    writer.close()
+
+    MAP(n_cells=1, n_genes=2).estimate_noise_to_parquet(parquet_path, output_path)
+    df = duckdb.connect().execute(f"SELECT gene_id FROM read_parquet('{output_path}')").df()
+    present_genes = set(df["gene_id"].tolist())
+    assert present_genes == {0}, f"Only gene 0 should be in output, got {present_genes}"
+    assert 1 not in present_genes, "Gene 1 has no posterior entries and must be absent from output"

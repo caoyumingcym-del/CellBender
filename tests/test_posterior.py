@@ -50,7 +50,7 @@ def test_compute_mean_target_removal_as_function(tmp_path, fpr, per_gene):
 
     cell_ids_arr = np.array(rows_list, dtype=np.int32)
     gene_ids_arr = np.zeros(len(rows_list), dtype=np.int32)
-    c_vals_arr = np.array(cols_list, dtype=np.int16)
+    c_vals_arr = np.array(cols_list, dtype=np.int32)
     log_probs_arr = np.array(vals_list, dtype=np.float32)
 
     parquet_path = tmp_path / "posterior.parquet"
@@ -102,7 +102,7 @@ def test_save_and_load(tmpdir_factory):
     # Create a fake posterior parquet with small cell/gene ids.
     cell_ids = np.random.randint(0, 100, size=num_nonzeros, dtype=np.int32)
     gene_ids = np.random.randint(0, 50, size=num_nonzeros, dtype=np.int32)
-    c_vals = np.random.randint(0, 10, size=num_nonzeros, dtype=np.int16)
+    c_vals = np.random.randint(0, 10, size=num_nonzeros, dtype=np.int32)
     log_probs = np.random.rand(num_nonzeros).astype(np.float32) * -10
 
     with pq.ParquetWriter(src_file, schema=POSTERIOR_SCHEMA) as writer:
@@ -158,7 +158,7 @@ def test_vi_model_freed_after_posterior_computation(tmpdir_factory):
     num_nonzeros = 50
     cell_ids = np.zeros(num_nonzeros, dtype=np.int32)
     gene_ids = np.arange(num_nonzeros, dtype=np.int32)
-    c_vals = np.ones(num_nonzeros, dtype=np.int16)
+    c_vals = np.ones(num_nonzeros, dtype=np.int32)
     log_probs = np.full(num_nonzeros, -1.0, dtype=np.float32)
 
     with pq.ParquetWriter(str(parquet_path), schema=POSTERIOR_SCHEMA) as writer:
@@ -195,7 +195,7 @@ def test_sort_posterior_parquet_uses_output_dir_as_tmpdir(tmpdir_factory):
     # Write entries in reverse gene order so the sort actually reorders rows.
     gene_ids = np.arange(num_nonzeros - 1, -1, -1, dtype=np.int32)
     cell_ids = np.zeros(num_nonzeros, dtype=np.int32)
-    c_vals = np.ones(num_nonzeros, dtype=np.int16)
+    c_vals = np.ones(num_nonzeros, dtype=np.int32)
     log_probs = np.full(num_nonzeros, -1.0, dtype=np.float32)
 
     with pq.ParquetWriter(str(parquet_path), schema=POSTERIOR_SCHEMA) as writer:
