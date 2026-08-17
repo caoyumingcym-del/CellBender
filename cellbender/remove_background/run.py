@@ -1,6 +1,7 @@
 """Single run of remove-background, given input arguments."""
 
 import argparse
+import gc
 import logging
 import os
 import sys
@@ -38,7 +39,8 @@ from cellbender.remove_background.posterior import (
     Posterior,
     PRmu,
     compute_mean_target_removal_as_function,
-    load_or_compute_posterior_and_save,
+    load_or_stream_posterior,
+    sort_and_save_posterior,
 )
 from cellbender.remove_background.report import plot_summary, run_notebook_make_html
 from cellbender.remove_background.sparse_utils import csr_set_rows_to_zero
@@ -128,34 +130,50 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
     if args.model == "naive":
         inferred_model = None
     else:
-        inferred_model, _, _, _ = run_inference(
+        inferred_model, _sched, _train_loader, _test_loader = run_inference(
             dataset_obj=dataset_obj,
             args=args,
             output_checkpoint_tarball=args.input_checkpoint_tarball,
         )
         inferred_model.eval()
+        # Training DataLoaders hold a copy of the count matrix that is no longer
+        # needed. Free them now so that copy is eligible for GC.
+        del _sched, _train_loader, _test_loader
+        gc.collect()
 
     try:
         file_dir, file_base = os.path.split(args.output_file)
         file_name = os.path.splitext(os.path.basename(file_base))[0]
 
-        # Create the posterior and save it.
-        posterior = load_or_compute_posterior_and_save(
+        # Stream the posterior to parquet (no sort yet).
+        posterior = load_or_stream_posterior(
             dataset_obj=dataset_obj,
             inferred_model=inferred_model,
             args=args,
         )
-        logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
+        logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-        # Save output plots.
+        # Drop all references to the model so GC can free it before the sort.
+        # posterior.model_loss already has the cached loss curve.
+        logger.info("Streaming complete. Freeing model memory before posterior sort...")
+        del inferred_model
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("Model memory freed.")
+
+        # Save output plots (uses cached model_loss; inferred_model no longer needed).
         save_output_plots(
             file_dir=file_dir,
             file_name=file_name,
             dataset_obj=dataset_obj,
-            inferred_model=inferred_model,
+            loss=posterior.model_loss,
             p=posterior.latents_map["p"],
             z=posterior.latents_map["z"],
         )
+
+        # Sort parquet, save to checkpoint, apply regularization.
+        sort_and_save_posterior(posterior=posterior, args=args)
+        logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
 
         # Save cell barcodes in a CSV file.
         analyzed_barcode_logic = posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF
@@ -201,7 +219,7 @@ def save_output_plots(
     file_dir: str,
     file_name: str,
     dataset_obj: SingleCellRNACountsDataset,
-    inferred_model: Optional[RemoveBackgroundPyroModel],
+    loss: Optional[dict],
     p: np.ndarray,
     z: np.ndarray,
 ) -> bool:
@@ -213,8 +231,7 @@ def save_output_plots(
 
         # Three-panel output summary plot.
         counts = np.array(dataset_obj.get_count_matrix().sum(axis=1)).squeeze()
-        loss = inferred_model.loss if inferred_model is not None else {}
-        fig = plot_summary(loss=loss, umi_counts=counts, p=p, z=z)
+        fig = plot_summary(loss=loss or {}, umi_counts=counts, p=p, z=z)
         fig.savefig(summary_fig_name, bbox_inches="tight", format="pdf")
         logger.info(f"Saved summary plots as {summary_fig_name}")
         return True
@@ -375,7 +392,6 @@ def compute_output_denoised_counts_reports_metrics(
 
         # Compile and save metrics.
         try:
-            assert isinstance(posterior.vi_model, RemoveBackgroundPyroModel)  # mypy
             df = collect_output_metrics(
                 dataset_obj=posterior.dataset_obj,
                 inferred_count_matrix=denoised_counts,

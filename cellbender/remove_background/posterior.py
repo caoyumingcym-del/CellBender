@@ -1,6 +1,7 @@
 """Posterior generation and regularization."""
 
 import argparse
+import gc
 import logging
 import os
 import shutil
@@ -74,76 +75,77 @@ def _posterior_global_latents_path(parquet_path: Path) -> Path:
     return parquet_path.parent / new_name
 
 
-def load_or_compute_posterior_and_save(
+def _do_posterior_regularization(
+    posterior: "Posterior",
+    dataset_obj: "SingleCellRNACountsDataset",
+    args: argparse.Namespace,
+) -> None:
+    """Apply posterior regularization in-place, or clear any stale cached regularization."""
+    if args.posterior_regularization is not None:
+        if args.posterior_regularization == "PRq":
+            posterior.regularize_posterior(
+                regularization=PRq,
+                alpha=args.prq_alpha,
+                device="cuda",
+            )
+        elif args.posterior_regularization == "PRmu":
+            assert dataset_obj.data is not None
+            posterior.regularize_posterior(
+                regularization=PRmu,
+                raw_count_matrix=dataset_obj.data["matrix"],
+                fpr=args.fpr[0],
+                per_gene=False,
+                device="cuda",
+            )
+        elif args.posterior_regularization == "PRmu_gene":
+            assert dataset_obj.data is not None
+            posterior.regularize_posterior(
+                regularization=PRmu,
+                raw_count_matrix=dataset_obj.data["matrix"],
+                fpr=args.fpr[0],
+                per_gene=True,
+                device="cuda",
+            )
+        else:
+            raise ValueError(
+                f"Got a posterior regularization input of "
+                f'"{args.posterior_regularization}", which is not '
+                f'allowed. Use ["PRq", "PRmu", "PRmu_gene"]'
+            )
+    else:
+        # Delete a pre-existing posterior regularization in case an old one was saved.
+        posterior.clear_regularized_posterior()
+
+
+def _checkpoint_assertion(tarball: str) -> None:
+    assert os.path.exists(tarball), (
+        f"Checkpoint file {tarball} does not exist, presumably because saving "
+        f"of the checkpoint file has been manually interrupted. Please re-run "
+        f"and allow a checkpoint file to be saved."
+    )
+
+
+def load_or_stream_posterior(
     dataset_obj: "SingleCellRNACountsDataset",
     inferred_model: Optional["RemoveBackgroundPyroModel"],
     args: argparse.Namespace,
 ) -> "Posterior":
-    """After inference, compute the full posterior noise count log probability
-    distribution. Save it and make it part of the checkpoint file.
+    """Create a Posterior object and stream the posterior to parquet if needed.
 
-    NOTE: Loads posterior from checkpoint file if available.
-    NOTE: Saves posterior as args.output_file + '_posterior.npz' and adds this
-        file to the checkpoint tarball as well.
+    Loads from checkpoint when a pre-computed posterior exists there.  Otherwise
+    streams the posterior computation to parquet (no sort yet).  Call
+    sort_and_save_posterior() next — ideally after freeing the model from the
+    caller's scope — to sort the parquet and persist it to the checkpoint.
 
     Args:
-        dataset_obj: Input data in the form of a SingleCellRNACountsDataset
-            object.
-        inferred_model: Model after inference is complete.
-        args: Input command line parsed arguments.
+        dataset_obj: Input data.
+        inferred_model: Trained model after inference is complete.
+        args: Parsed command line arguments.
 
     Returns:
-        posterior: Posterior object with noise count log prob computed, as well
-            as regularization if called for.
-
+        Posterior object with parquet on disk (unsorted if freshly computed).
     """
-
-    assert os.path.exists(args.input_checkpoint_tarball), (
-        f"Checkpoint file {args.input_checkpoint_tarball} does not exist, "
-        f"presumably because saving of the checkpoint file has been manually "
-        f"interrupted. load_or_compute_posterior_and_save() will not work "
-        f"properly without an existing checkpoint file. Please re-run and "
-        f"allow a checkpoint file to be saved."
-    )
-
-    def _do_posterior_regularization(posterior: Posterior):
-
-        # Optional posterior regularization.
-        if args.posterior_regularization is not None:
-            if args.posterior_regularization == "PRq":
-                posterior.regularize_posterior(
-                    regularization=PRq,
-                    alpha=args.prq_alpha,
-                    device="cuda",
-                )
-            elif args.posterior_regularization == "PRmu":
-                assert dataset_obj.data is not None
-                posterior.regularize_posterior(
-                    regularization=PRmu,
-                    raw_count_matrix=dataset_obj.data["matrix"],
-                    fpr=args.fpr[0],
-                    per_gene=False,
-                    device="cuda",
-                )
-            elif args.posterior_regularization == "PRmu_gene":
-                assert dataset_obj.data is not None
-                posterior.regularize_posterior(
-                    regularization=PRmu,
-                    raw_count_matrix=dataset_obj.data["matrix"],
-                    fpr=args.fpr[0],
-                    per_gene=True,
-                    device="cuda",
-                )
-            else:
-                raise ValueError(
-                    f"Got a posterior regularization input of "
-                    f'"{args.posterior_regularization}", which is not '
-                    f'allowed. Use ["PRq", "PRmu", "PRmu_gene"]'
-                )
-
-        else:
-            # Delete a pre-existing posterior regularization in case an old one was saved.
-            posterior.clear_regularized_posterior()
+    _checkpoint_assertion(args.input_checkpoint_tarball)
 
     posterior = Posterior(
         dataset_obj=dataset_obj,
@@ -168,20 +170,43 @@ def load_or_compute_posterior_and_save(
             force_use_checkpoint=args.force_use_checkpoint,
         )
     if os.path.exists(ckpt_posterior.get("posterior_file", "does_not_exist")):
-        # Load posterior if it was saved in the checkpoint.
+        # Load pre-computed posterior from checkpoint; already sorted.
         posterior.load(file=ckpt_posterior["posterior_file"])
-        _do_posterior_regularization(posterior)
+        # _sort_needed stays False — the checkpoint parquet is already sorted.
     else:
-        # Compute posterior.
+        # Stream the posterior to parquet (sort happens in sort_and_save_posterior).
         logger.info("Posterior not currently included in checkpoint.")
         posterior_parquet_file = args.output_file[:-3] + "_posterior.parquet"
-        posterior.ensure_posterior_computed(
-            path=Path(posterior_parquet_file),
+        posterior.ensure_posterior_computed(path=Path(posterior_parquet_file))
+
+    return posterior
+
+
+def sort_and_save_posterior(
+    posterior: "Posterior",
+    args: argparse.Namespace,
+) -> None:
+    """Sort the posterior parquet, save it to the checkpoint, and regularize.
+
+    Intended to be called after load_or_stream_posterior() and after the caller
+    has freed the model from memory, so the sort runs with maximum headroom.
+
+    Args:
+        posterior: Posterior object returned by load_or_stream_posterior().
+        args: Parsed command line arguments.
+    """
+    if posterior._sort_needed:
+        assert posterior._posterior_parquet_path is not None
+        logger.info("Starting posterior parquet sort (this may take a while)...")
+        sort_posterior_parquet(
+            posterior._posterior_parquet_path,
             duckdb_memory_limit=args.duckdb_memory_limit,
         )
-        _do_posterior_regularization(posterior)
+        logger.info("Posterior sort complete.")
+        posterior._sort_needed = False
 
-        # Save posterior and add it to checkpoint tarball.
+        # Save sorted parquet to the checkpoint tarball.
+        posterior_parquet_file = str(posterior._posterior_parquet_path)
         saved = posterior.save(file=posterior_parquet_file)
         success = False
         if saved:
@@ -206,6 +231,28 @@ def load_or_compute_posterior_and_save(
         else:
             logger.warning("Failed to add posterior object to checkpoint file.")
 
+    assert posterior.dataset_obj is not None
+    _do_posterior_regularization(posterior, posterior.dataset_obj, args)
+
+
+def load_or_compute_posterior_and_save(
+    dataset_obj: "SingleCellRNACountsDataset",
+    inferred_model: Optional["RemoveBackgroundPyroModel"],
+    args: argparse.Namespace,
+) -> "Posterior":
+    """Stream, sort, save, and regularize the posterior in one call.
+
+    Convenience wrapper around load_or_stream_posterior() +
+    sort_and_save_posterior().  Prefer calling those two functions separately
+    from run_remove_background() so that the model can be freed before the
+    sort runs.
+    """
+    posterior = load_or_stream_posterior(
+        dataset_obj=dataset_obj,
+        inferred_model=inferred_model,
+        args=args,
+    )
+    sort_and_save_posterior(posterior=posterior, args=args)
     return posterior
 
 
@@ -267,6 +314,7 @@ class Posterior:
         self.float_threshold = float_threshold
         self.posterior_batch_size = posterior_batch_size
         self._posterior_parquet_path: Path | None = None
+        self._sort_needed: bool = False
         self._noise_count_posterior_kwargs: dict | None = None
         self._noise_count_regularized_posterior_coo: sp.coo_matrix | None = None
         self._noise_count_regularized_posterior_kwargs: dict | None = None
@@ -481,9 +529,11 @@ class Posterior:
         y_map: bool = True,
         n_counts_max: int = 20,
         smallest_log_probability: float = -10.0,
-        duckdb_memory_limit: Optional[str] = None,
     ) -> None:
         """Compute posterior noise count probabilities and stream them to parquet.
+
+        Does NOT sort the parquet — set self._sort_needed=True after this returns
+        and call sort_posterior_parquet() separately (see sort_and_save_posterior).
 
         Args:
             path: Destination path for the posterior parquet file.
@@ -491,8 +541,6 @@ class Posterior:
             y_map: Use MAP estimate of y (cell/empty) instead of sampling.
             n_counts_max: Maximum noise count axis size.
             smallest_log_probability: Entries below this threshold are discarded.
-            duckdb_memory_limit: DuckDB memory cap for the post-streaming sort
-                (e.g. '4GB'). When None, DuckDB auto-detects (~80% of RAM).
 
         """
 
@@ -540,7 +588,7 @@ class Posterior:
         else:
             assert self.barcode_inds is not None
             barcode_inds = torch.tensor(self.barcode_inds.copy())
-        logger.info("Computing posterior noise count probabilities in mini-batches.")
+        logger.info(f"Computing posterior noise count probabilities in {n_minibatches} chunk(s).")
 
         path.parent.mkdir(parents=True, exist_ok=True)
         with pq.ParquetWriter(str(path), schema=POSTERIOR_SCHEMA) as writer:
@@ -596,18 +644,35 @@ class Posterior:
 
                 ind += data.shape[0]
 
-        # Cache the training loss curve before freeing the model, so it remains
-        # accessible for writing to the output h5 file.
+                # Free large per-chunk tensors immediately to keep peak memory low.
+                del noise_log_pdf_NGC, noise_count_offset_NG, tensor_for_nonzeros
+                del bcs_i_chunk, genes_i_analyzed, c_i, log_prob_i
+                del genes_i, bcs_i, offset_i, c_i_absolute, data
+                gc.collect()
+
+            logger.info("All chunks complete. Closing parquet writer...")
+
+        logger.info("Parquet writer closed.")
+
+        # Free the DataLoader, count matrix slice, and index tensors before the
+        # sort. These are separate allocations from dataset_obj's full matrix.
+        del cell_data_loader, count_matrix, dataloader_index_to_analyzed_bc_index
+        del analyzed_gene_inds, barcode_inds
+        gc.collect()
+
+        # Cache the training loss curve before releasing the model reference,
+        # so it remains accessible for writing to the output h5 file.
         if self.vi_model is not None:
             self._model_loss = self.vi_model.loss
-        # Model is no longer needed: latents were computed at the start of this
-        # function (~line 491) and are cached in self._latents. Freeing it now
-        # reduces memory pressure during the sort that follows.
+        # Drop the Posterior's own reference to the model. The caller's reference
+        # (inferred_model in run_remove_background) must also be dropped before
+        # the sort runs — that is done by run_remove_background between calling
+        # load_or_stream_posterior() and sort_and_save_posterior().
         self.vi_model = None
         torch.cuda.empty_cache()
 
-        # Sort parquet for efficient DuckDB scans.
-        sort_posterior_parquet(path, duckdb_memory_limit=duckdb_memory_limit)
+        # Mark that the parquet needs sorting before DuckDB queries can use it.
+        self._sort_needed = True
 
         # Write per-barcode latents CSV sidecar.
         write_posterior_latents_csv(_posterior_latents_path(path), self.latents_map)
