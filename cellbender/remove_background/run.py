@@ -37,7 +37,6 @@ from cellbender.remove_background.exceptions import ElboException
 from cellbender.remove_background.model import RemoveBackgroundPyroModel
 from cellbender.remove_background.posterior import (
     Posterior,
-    PRmu,
     compute_mean_target_removal_as_function,
     load_or_stream_posterior,
     sort_and_save_posterior,
@@ -77,9 +76,7 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
                 "posterior_batch_size",
                 "checkpoint_min",
                 "truth_file",
-                "posterior_regularization",
                 "cdf_threshold_q",
-                "prq_alpha",
                 "estimator",
                 "use_multiprocessing_estimation",
                 "cpu_threads",
@@ -309,21 +306,6 @@ def compute_output_denoised_counts_reports_metrics(
     for fpr in args.fpr:
         logger.debug(f"Working on FPR {fpr}")
 
-        # Regularize posterior again at this FPR, if needed.
-        if args.posterior_regularization in ["PRmu", "PRmu_gene"]:
-            # TODO: currently this re-calculates the first FPR which is not necessary
-            posterior.regularize_posterior(
-                regularization=PRmu,
-                raw_count_matrix=posterior.dataset_obj.data["matrix"],
-                fpr=fpr,
-                per_gene=True if (args.posterior_regularization == "PRmu_gene") else False,
-                device="cuda",
-            )
-        else:
-            # Other posterior regularizations were already performed in
-            # posterior.load_or_compute_posterior_and_save()
-            pass
-
         # If using MCKP, recompute noise targets for this FPR.
         if noise_target_fun is not None:
             noise_targets = noise_target_fun(fpr).detach().cpu().numpy()
@@ -337,76 +319,20 @@ def compute_output_denoised_counts_reports_metrics(
         fpr_output_filename = os.path.join(file_dir, file_name + name_suffix + ".h5")
         filtered_output_file = os.path.join(file_dir, file_name + name_suffix + "_filtered.h5")
 
-        # Use streaming (gene-batched) path when the posterior is parquet-backed
-        # and no in-memory regularized COO has been materialised.
-        can_stream = posterior.posterior_path is not None and posterior.regularized_posterior_kwargs is None
-
         total_denoised_counts: Optional[float] = None
 
-        if can_stream:
-            logger.info(f"Computing denoised counts using {args.estimator} estimator (streaming)")
-            estimator_obj = estimator(index_converter=posterior.index_converter)
-            full_ok, filt_ok, total_denoised_counts = _write_streaming_denoised_outputs(
-                posterior=posterior,
-                estimator_obj=estimator_obj,
-                noise_targets=noise_targets,
-                args=args,
-                fpr=fpr,
-                fpr_output_filename=fpr_output_filename,
-                filtered_output_file=filtered_output_file,
-            )
-            success = success and full_ok and filt_ok
-        else:
-            # Fall back to full-matrix path (regularized posterior or no parquet).
-            logger.info(f"Computing denoised counts using {args.estimator} estimator")
-            denoised_counts = posterior.compute_denoised_counts(
-                estimator_constructor=estimator,
-                noise_targets_per_gene=noise_targets,
-                q=args.cdf_threshold_q,
-                alpha=args.prq_alpha,
-                device="cuda" if args.use_cuda else "cpu",
-                use_multiple_processes=args.use_multiprocessing_estimation,
-                duckdb_memory_limit=args.duckdb_memory_limit,
-            )
-
-            # Restore eliminated features in cells.
-            logger.debug("Restoring eliminated features in cells")
-            denoised_counts = posterior.dataset_obj.restore_eliminated_features_in_cells(
-                denoised_counts,
-                posterior.latents_map["p"],
-            )
-
-            # Failsafe to ensure no negative counts.
-            assert np.all(denoised_counts.data >= 0), "Negative count matrix entries in output"
-
-            def _writer_helper(file, **kwargs) -> bool:
-                _dataset_obj = posterior.dataset_obj
-                assert _dataset_obj is not None
-                return write_denoised_count_matrix(
-                    file=file,
-                    denoised_count_matrix=denoised_counts,
-                    posterior_regularization=args.posterior_regularization,
-                    posterior_regularization_kwargs=posterior.regularized_posterior_kwargs,
-                    estimator=args.estimator,
-                    estimator_kwargs=None if (args.cdf_threshold_q is None) else {"q": args.cdf_threshold_q},
-                    latents=posterior.latents_map,
-                    dataset_obj=_dataset_obj,
-                    learning_curve=posterior.model_loss,
-                    fpr=fpr,
-                    **kwargs,
-                )
-
-            write_succeeded = _writer_helper(file=fpr_output_filename)
-            success = success and write_succeeded
-
-            analyzed_barcode_logic = posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF
-            write_succeeded = _writer_helper(
-                file=filtered_output_file,
-                analyzed_barcode_logic=analyzed_barcode_logic,
-                barcode_inds=posterior.dataset_obj.analyzed_barcode_inds[analyzed_barcode_logic],
-            )
-            success = success and write_succeeded
-            total_denoised_counts = float(denoised_counts.sum())
+        logger.info(f"Computing denoised counts using {args.estimator} estimator (streaming)")
+        estimator_obj = estimator(index_converter=posterior.index_converter)
+        full_ok, filt_ok, total_denoised_counts = _write_streaming_denoised_outputs(
+            posterior=posterior,
+            estimator_obj=estimator_obj,
+            noise_targets=noise_targets,
+            args=args,
+            fpr=fpr,
+            fpr_output_filename=fpr_output_filename,
+            filtered_output_file=filtered_output_file,
+        )
+        success = success and full_ok and filt_ok
 
         # Compile and save metrics.
         try:
@@ -520,12 +446,6 @@ def _write_streaming_denoised_outputs(
         "fraction_data_used_for_testing": 1.0 - consts.TRAINING_FRACTION,
         "target_false_positive_rate": fpr,
     }
-    pr = args.posterior_regularization
-    if pr is not None:
-        metadata["posterior_regularization"] = [pr]
-        pr_kwargs = posterior.regularized_posterior_kwargs
-        if pr_kwargs is not None:
-            metadata["posterior_regularization_kwargs"] = pr_kwargs
     metadata["estimator"] = [args.estimator]
     if args.cdf_threshold_q is not None:
         metadata["estimator_kwargs"] = {"q": args.cdf_threshold_q}
@@ -626,104 +546,6 @@ def _write_streaming_denoised_outputs(
         logger.warning(f"Could not delete temp noise parquet: {noise_parquet}")
 
     return full_write_succeeded, filtered_write_succeeded, total_denoised_counts
-
-
-def write_denoised_count_matrix(
-    file: str,
-    denoised_count_matrix: sp.csr_matrix,
-    posterior_regularization: Optional[str],
-    posterior_regularization_kwargs: Optional[Dict[str, float]],
-    estimator: str,
-    estimator_kwargs: Optional[Dict[str, float]],
-    latents: Dict[str, np.ndarray],
-    dataset_obj: SingleCellRNACountsDataset,
-    learning_curve: Any,  # inferred_model.loss
-    fpr: float,
-    analyzed_barcode_logic: Any = ...,
-    barcode_inds: Any = ...,
-) -> bool:
-    """Helper function for writing output h5 files"""
-
-    assert dataset_obj.data is not None
-
-    z = latents["z"][analyzed_barcode_logic, :]
-    d = latents["d"][analyzed_barcode_logic]
-    p = latents["p"][analyzed_barcode_logic]
-    epsilon = latents["epsilon"][analyzed_barcode_logic]
-
-    # Inferred ambient gene expression vector.
-    ambient_expression_trimmed = pyro.param("chi_ambient").detach().cpu().numpy()
-
-    # Convert the indices from trimmed gene set to original gene indices.
-    ambient_expression = np.zeros(dataset_obj.data["matrix"].shape[1])
-    ambient_expression[dataset_obj.analyzed_gene_inds] = ambient_expression_trimmed
-
-    # Some summary statistics:
-    # Fraction of counts in each droplet that were removed.
-    raw_count_matrix = dataset_obj.data["matrix"][dataset_obj.analyzed_barcode_inds, :]  # need all genes
-    raw_counts_droplet = np.array(raw_count_matrix.sum(axis=1)).squeeze()
-    out_counts_droplet = np.array(denoised_count_matrix[dataset_obj.analyzed_barcode_inds, :].sum(axis=1)).squeeze()
-    background_fraction = ((raw_counts_droplet - out_counts_droplet) / (raw_counts_droplet + 0.001))[
-        analyzed_barcode_logic
-    ]
-
-    # Handle the optional rho parameters.
-    rho = None
-    if ("rho_alpha" in pyro.get_param_store().keys()) and ("rho_beta" in pyro.get_param_store().keys()):
-        rho = np.array(
-            [
-                pyro.param("rho_alpha").detach().cpu().numpy().item(),
-                pyro.param("rho_beta").detach().cpu().numpy().item(),
-            ]
-        )
-
-    # Determine metadata fields.
-    # Wrap in lists to avoid scanpy loading bug
-    # which may already be fixed by https://github.com/scverse/scanpy/pull/2344
-    metadata = {
-        "learning_curve": learning_curve,
-        "barcodes_analyzed": dataset_obj.data["barcodes"][dataset_obj.analyzed_barcode_inds],
-        "barcodes_analyzed_inds": dataset_obj.analyzed_barcode_inds,
-        "features_analyzed_inds": dataset_obj.analyzed_gene_inds,
-        "fraction_data_used_for_testing": 1.0 - consts.TRAINING_FRACTION,
-        "target_false_positive_rate": fpr,
-    }
-    for k in ["posterior_regularization", "posterior_regularization_kwargs", "estimator", "estimator_kwargs"]:
-        val = locals().get(k)  # give me the input variable with this name
-        if val is not None:
-            if not isinstance(val, dict):
-                if not isinstance(val, list):
-                    val = [val]  # wrap in a list, unless it's a dict
-            metadata.update({k: val})
-
-    # Write h5.
-    write_succeeded = write_matrix_to_cellranger_h5(
-        cellranger_version=3,  # always write v3 format output
-        output_file=file,
-        gene_names=dataset_obj.data["gene_names"],
-        gene_ids=dataset_obj.data["gene_ids"],
-        feature_types=dataset_obj.data["feature_types"],
-        genomes=dataset_obj.data["genomes"],
-        barcodes=dataset_obj.data["barcodes"][barcode_inds],
-        count_matrix=denoised_count_matrix[barcode_inds, :],
-        local_latents={
-            "barcode_indices_for_latents": dataset_obj.analyzed_barcode_inds,
-            "gene_expression_encoding": z,
-            "cell_size": d,
-            "cell_probability": p,
-            "droplet_efficiency": epsilon,
-            "background_fraction": background_fraction,
-        },
-        global_latents={
-            "ambient_expression": ambient_expression,
-            "empty_droplet_size_lognormal_loc": np.array(pyro.param("d_empty_loc").item()),
-            "empty_droplet_size_lognormal_scale": np.array(pyro.param("d_empty_scale").item()),
-            "cell_size_lognormal_std": np.array(pyro.param("d_cell_scale").item()),
-            "swapping_fraction_dist_params": rho,
-        },
-        metadata=metadata,
-    )
-    return write_succeeded
 
 
 def collect_output_metrics(

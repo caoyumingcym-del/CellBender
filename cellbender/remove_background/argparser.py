@@ -303,29 +303,6 @@ def add_subparser_args(subparsers: argparse._SubParsersAction) -> argparse._SubP
         "(will be slower).",
     )
     subparser.add_argument(
-        "--posterior-regularization",
-        type=str,
-        default=None,
-        choices=["PRq", "PRmu", "PRmu_gene"],
-        dest="posterior_regularization",
-        help="Posterior regularization method. (For experts: "
-        "not required for normal usage, see "
-        "documentation). PRq is approximate quantile-"
-        "targeting. PRmu is approximate mean-targeting "
-        "aggregated over genes (behavior of v0.2.0). "
-        "PRmu_gene is approximate mean-targeting per "
-        "gene.",
-    )
-    subparser.add_argument(
-        "--alpha",
-        type=float,
-        default=None,
-        dest="prq_alpha",
-        help="Tunable parameter alpha for the PRq posterior "
-        "regularization method (not normally used: see "
-        "documentation).",
-    )
-    subparser.add_argument(
         "--q",
         type=float,
         default=None,

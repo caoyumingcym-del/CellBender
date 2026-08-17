@@ -1,12 +1,11 @@
 """Classes and methods for estimation of noise counts, given a posterior."""
 
 import logging
-import multiprocessing as mp
 import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Dict, Generator, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Tuple
 
 if TYPE_CHECKING:
     from cellbender.remove_background.posterior import IndexConverter
@@ -14,67 +13,34 @@ if TYPE_CHECKING:
 import duckdb
 import numpy as np
 import pandas as pd
-import pyarrow as pa
 import scipy.sparse as sp
-import torch
-from torch.distributions.categorical import Categorical
-
-from cellbender.remove_background.sparse_utils import log_prob_sparse_to_dense
 
 logger = logging.getLogger("cellbender")
 
-N_CELLS_DATATYPE = np.int32
-N_GENES_DATATYPE = np.int32
 COUNT_DATATYPE = np.int32
-
-PosteriorSource = Union[sp.coo_matrix, Path]
 
 
 class EstimationMethod(ABC):
     """Base class for estimation of noise counts, given a posterior."""
 
     def __init__(self, index_converter: "IndexConverter"):
-        """Instantiate the EstimationMethod.
-        Args:
-            index_converter: The IndexConverter that can be used to translate
-                back and forth between count matrix (n, g) indices, and the
-                flattened, generalized 'm' indices that index the posterior COO.
-        """
         self.index_converter = index_converter
         super(EstimationMethod, self).__init__()
 
     @abstractmethod
-    def estimate_noise(self, noise_log_prob_coo: "PosteriorSource", **kwargs) -> sp.csr_matrix:
-        """Given the full probabilistic posterior, compute noise counts.
+    def estimate_noise_to_parquet(
+        self,
+        noise_log_prob_coo: Path,
+        output_path: Path,
+        **kwargs,
+    ) -> None:
+        """Given the posterior parquet, compute noise counts and write to parquet.
+
         Args:
-            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
-                values and absolute noise count columns, or a Path to a
-                posterior parquet file.
+            noise_log_prob_coo: Path to the posterior parquet file.
+            output_path: Destination parquet with (cell_id, gene_id, noise_count).
         """
         pass
-
-    def _estimation_array_to_csr(self, data: np.ndarray, m: np.ndarray, dtype=COUNT_DATATYPE) -> sp.csr_matrix:
-        """Say you have point estimates for each count matrix element (data) and
-        you have the 'm'-indices for each value (m). This returns a CSR matrix
-        that has the shape of the count matrix, where duplicate entries have
-        been summed.
-
-        Args:
-            data: Point estimates (absolute noise counts) for each nonzero entry
-                of the count matrix, in a flat format, indexed by 'm'.
-            m: Array of the same length as data, where each entry is an m-index.
-            dtype: Data type for sparse matrix. Int32 is too small for 'm' indices.
-
-        Results:
-            noise_csr: Noise point estimate, as a CSR sparse matrix.
-
-        """
-        return _estimation_array_to_csr(
-            index_converter=self.index_converter,
-            data=data,
-            m=m,
-            dtype=dtype,
-        )
 
 
 class SingleSample(EstimationMethod):
@@ -82,23 +48,12 @@ class SingleSample(EstimationMethod):
 
     def estimate_noise_to_parquet(
         self,
-        noise_log_prob_coo: "PosteriorSource",
+        noise_log_prob_coo: Path,
         output_path: Path,
         duckdb_memory_limit: Optional[str] = None,
         **kwargs,
     ) -> None:
-        """Estimate noise counts and write to parquet without Python materialisation.
-
-        Only supported for the parquet path. Falls back to in-memory estimation
-        for COO sources (regularized posterior).
-
-        Args:
-            noise_log_prob_coo: Path to posterior parquet.
-            output_path: Destination parquet with (cell_id, gene_id, noise_count).
-            duckdb_memory_limit: DuckDB memory cap.
-        """
-        if not isinstance(noise_log_prob_coo, Path):
-            raise NotImplementedError("estimate_noise_to_parquet only supports parquet source")
+        """Estimate noise counts and write to parquet without Python materialisation."""
         query = """
             SELECT
                 cell_id,
@@ -108,53 +63,7 @@ class SingleSample(EstimationMethod):
             WHERE NOT regularized
             GROUP BY cell_id, gene_id
         """
-        _estimate_via_sql_to_parquet(noise_log_prob_coo, self.index_converter, query, output_path, duckdb_memory_limit)
-
-    @torch.no_grad()
-    def estimate_noise(
-        self,
-        noise_log_prob_coo: "PosteriorSource",
-        device: str = "cpu",
-        duckdb_memory_limit: Optional[str] = None,
-        **kwargs,
-    ) -> sp.csr_matrix:
-        """Given the full probabilistic posterior, compute noise counts by
-        taking a single sample from each probability distribution.
-
-        Args:
-            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
-                values and absolute noise count columns, or a Path to a
-                posterior parquet file.
-            device: ['cpu', 'cuda'] - only used for the COO path.
-            duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'); only used for the parquet
-                path. When None, DuckDB auto-detects (~80% of system RAM).
-
-        Returns:
-            noise_count_csr: Estimated noise count matrix.
-        """
-        if isinstance(noise_log_prob_coo, Path):
-            # Gumbel-max trick: argmax(log_p_i + Gumbel(0,1)_i) ~ Categorical(softmax(log_p))
-            query = """
-                SELECT
-                    cell_id,
-                    gene_id,
-                    CAST(argmax(c, log_prob - LN(-LN(random()))) AS INTEGER) AS noise_count
-                FROM posterior
-                WHERE NOT regularized
-                GROUP BY cell_id, gene_id
-            """
-            return _estimate_via_sql(
-                noise_log_prob_coo,
-                self.index_converter,
-                query,
-                duckdb_memory_limit=duckdb_memory_limit,
-            )
-
-        def _torch_sample(x, col_values, **kw):
-            return col_values[Categorical(logits=x, validate_args=False).sample().long()]
-
-        result = apply_function_dense_chunks(noise_log_prob_coo=noise_log_prob_coo, fun=_torch_sample, device=device)
-        return self._estimation_array_to_csr(data=result["result"], m=result["m"])
+        _estimate_via_sql_to_parquet(noise_log_prob_coo, query, output_path, duckdb_memory_limit)
 
 
 class Mean(EstimationMethod):
@@ -162,14 +71,12 @@ class Mean(EstimationMethod):
 
     def estimate_noise_to_parquet(
         self,
-        noise_log_prob_coo: "PosteriorSource",
+        noise_log_prob_coo: Path,
         output_path: Path,
         duckdb_memory_limit: Optional[str] = None,
         **kwargs,
     ) -> None:
         """Estimate mean noise counts and write to parquet without Python materialisation."""
-        if not isinstance(noise_log_prob_coo, Path):
-            raise NotImplementedError("estimate_noise_to_parquet only supports parquet source")
         query = """
             WITH shifted AS (
                 SELECT
@@ -195,88 +102,20 @@ class Mean(EstimationMethod):
             FROM normalized
             GROUP BY cell_id, gene_id
         """
-        _estimate_via_sql_to_parquet(noise_log_prob_coo, self.index_converter, query, output_path, duckdb_memory_limit)
-
-    def estimate_noise(
-        self,
-        noise_log_prob_coo: "PosteriorSource",
-        device: str = "cpu",
-        duckdb_memory_limit: Optional[str] = None,
-        **kwargs,
-    ) -> sp.csr_matrix:
-        """Given the full probabilistic posterior, compute noise counts by
-        taking the mean of each probability distribution.
-
-        Args:
-            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
-                values and absolute noise count columns, or a Path to a
-                posterior parquet file.
-            device: ['cpu', 'cuda'] - only used for the COO path.
-            duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'); only used for the parquet
-                path. When None, DuckDB auto-detects (~80% of system RAM).
-
-        Returns:
-            noise_count_csr: Estimated noise count matrix.
-        """
-        if isinstance(noise_log_prob_coo, Path):
-            # Log-max shift for numerical stability before exponentiation.
-            query = """
-                WITH shifted AS (
-                    SELECT
-                        cell_id,
-                        gene_id,
-                        c,
-                        EXP(log_prob - MAX(log_prob) OVER (PARTITION BY cell_id, gene_id)) AS prob_raw
-                    FROM posterior
-                    WHERE NOT regularized
-                ),
-                normalized AS (
-                    SELECT
-                        cell_id,
-                        gene_id,
-                        c,
-                        prob_raw / SUM(prob_raw) OVER (PARTITION BY cell_id, gene_id) AS prob
-                    FROM shifted
-                )
-                SELECT
-                    cell_id,
-                    gene_id,
-                    SUM(CAST(c AS DOUBLE) * prob) AS noise_count
-                FROM normalized
-                GROUP BY cell_id, gene_id
-            """
-            return _estimate_via_sql(
-                noise_log_prob_coo,
-                self.index_converter,
-                query,
-                dtype=np.float32,
-                duckdb_memory_limit=duckdb_memory_limit,
-            )
-
-        def _torch_mean(x, col_values, **kw):
-            return torch.matmul(x.exp(), col_values)
-
-        result = apply_function_dense_chunks(noise_log_prob_coo=noise_log_prob_coo, fun=_torch_mean, device=device)
-        return self._estimation_array_to_csr(data=result["result"], m=result["m"], dtype=np.float32)
+        _estimate_via_sql_to_parquet(noise_log_prob_coo, query, output_path, duckdb_memory_limit)
 
 
 class MAP(EstimationMethod):
     """The canonical maximum a posteriori"""
 
-    @staticmethod
-    def torch_argmax(x, col_values, **kwargs):
-        return col_values[x.argmax(dim=-1).long()]
-
     def estimate_noise_to_parquet(
         self,
-        noise_log_prob_coo: "PosteriorSource",
+        noise_log_prob_coo: Path,
         output_path: Path,
         duckdb_memory_limit: Optional[str] = None,
         **kwargs,
     ) -> None:
         """Estimate MAP noise counts and write to parquet without Python materialisation."""
-        if not isinstance(noise_log_prob_coo, Path):
-            raise NotImplementedError("estimate_noise_to_parquet only supports parquet source")
         query = """
             SELECT
                 cell_id,
@@ -286,71 +125,21 @@ class MAP(EstimationMethod):
             WHERE NOT regularized
             GROUP BY cell_id, gene_id
         """
-        _estimate_via_sql_to_parquet(noise_log_prob_coo, self.index_converter, query, output_path, duckdb_memory_limit)
-
-    def estimate_noise(
-        self,
-        noise_log_prob_coo: "PosteriorSource",
-        device: str = "cpu",
-        duckdb_memory_limit: Optional[str] = None,
-        **kwargs,
-    ) -> sp.csr_matrix:
-        """Given the full probabilistic posterior, compute noise counts by
-        taking the maximum a posteriori (MAP) of each probability distribution.
-
-        Args:
-            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
-                values and absolute noise count columns, or a Path to a
-                posterior parquet file.
-            device: ['cpu', 'cuda'] - only used for the COO path.
-            duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'); only used for the parquet
-                path. When None, DuckDB auto-detects (~80% of system RAM).
-
-        Returns:
-            noise_count_csr: Estimated noise count matrix.
-        """
-        if isinstance(noise_log_prob_coo, Path):
-            query = """
-                SELECT
-                    cell_id,
-                    gene_id,
-                    CAST(argmax(c, log_prob) AS INTEGER) AS noise_count
-                FROM posterior
-                WHERE NOT regularized
-                GROUP BY cell_id, gene_id
-            """
-            return _estimate_via_sql(
-                noise_log_prob_coo,
-                self.index_converter,
-                query,
-                duckdb_memory_limit=duckdb_memory_limit,
-            )
-
-        result = apply_function_dense_chunks(
-            noise_log_prob_coo=noise_log_prob_coo, fun=self.torch_argmax, device=device
-        )
-        return self._estimation_array_to_csr(data=result["result"], m=result["m"])
+        _estimate_via_sql_to_parquet(noise_log_prob_coo, query, output_path, duckdb_memory_limit)
 
 
 class ThresholdCDF(EstimationMethod):
     """Noise estimation via thresholding the noise count CDF"""
 
-    @staticmethod
-    def torch_cdf_fun(x: torch.Tensor, q: float, col_values: torch.Tensor, **kwargs):
-        compact_idx = (x.exp().cumsum(dim=-1) <= q).sum(dim=-1).long()
-        return col_values[compact_idx.clamp(max=len(col_values) - 1)]
-
     def estimate_noise_to_parquet(
         self,
-        noise_log_prob_coo: "PosteriorSource",
+        noise_log_prob_coo: Path,
         output_path: Path,
         q: float = 0.5,
         duckdb_memory_limit: Optional[str] = None,
         **kwargs,
     ) -> None:
         """Estimate CDF-threshold noise counts and write to parquet."""
-        if not isinstance(noise_log_prob_coo, Path):
-            raise NotImplementedError("estimate_noise_to_parquet only supports parquet source")
         query = f"""
             WITH cumulative AS (
                 SELECT
@@ -375,126 +164,15 @@ class ThresholdCDF(EstimationMethod):
             FROM cumulative
             GROUP BY cell_id, gene_id
         """
-        _estimate_via_sql_to_parquet(noise_log_prob_coo, self.index_converter, query, output_path, duckdb_memory_limit)
-
-    def estimate_noise(
-        self,
-        noise_log_prob_coo: "PosteriorSource",
-        q: float = 0.5,
-        device: str = "cpu",
-        duckdb_memory_limit: Optional[str] = None,
-        **kwargs,
-    ) -> sp.csr_matrix:
-        """Given the full probabilistic posterior, compute noise counts
-
-        Args:
-            noise_log_prob_coo: Either a (m, c) COO matrix with log prob
-                values and absolute noise count columns, or a Path to a
-                posterior parquet file.
-            q: The CDF threshold value.
-            device: ['cpu', 'cuda'] - only used for the COO path.
-            duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'); only used for the parquet
-                path. When None, DuckDB auto-detects (~80% of system RAM).
-
-        Returns:
-            noise_count_csr: Estimated noise count matrix.
-        """
-        if isinstance(noise_log_prob_coo, Path):
-            # COALESCE to MAX(c) handles the edge case where no entry's cumsum exceeds q.
-            query = f"""
-                WITH cumulative AS (
-                    SELECT
-                        cell_id,
-                        gene_id,
-                        c,
-                        SUM(EXP(log_prob)) OVER (
-                            PARTITION BY cell_id, gene_id
-                            ORDER BY c
-                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                        ) AS cum_prob
-                    FROM posterior
-                    WHERE NOT regularized
-                )
-                SELECT
-                    cell_id,
-                    gene_id,
-                    CAST(COALESCE(
-                        MIN(CASE WHEN cum_prob > {q} THEN c END),
-                        MAX(c)
-                    ) AS INTEGER) AS noise_count
-                FROM cumulative
-                GROUP BY cell_id, gene_id
-            """
-            return _estimate_via_sql(
-                noise_log_prob_coo,
-                self.index_converter,
-                query,
-                duckdb_memory_limit=duckdb_memory_limit,
-            )
-
-        result = apply_function_dense_chunks(
-            noise_log_prob_coo=noise_log_prob_coo, fun=self.torch_cdf_fun, device=device, q=q
-        )
-        return self._estimation_array_to_csr(data=result["result"], m=result["m"])
-
-
-def _estimation_array_to_csr(index_converter, data: np.ndarray, m: np.ndarray, dtype=COUNT_DATATYPE) -> sp.csr_matrix:
-    """Say you have point estimates for each count matrix element (data) and
-    you have the 'm'-indices for each value (m). This returns a CSR matrix
-    that has the shape of the count matrix, where duplicate entries have
-    been summed.
-
-    Args:
-        data: Point estimates (absolute noise counts) for each nonzero entry
-            of the count matrix, in a flat format, indexed by 'm'.
-        m: Array of the same length as data, where each entry is an m-index.
-        dtype: Data type for values of sparse matrix
-
-    Results:
-        noise_csr: Noise point estimate, as a CSR sparse matrix.
-
-    """
-    row, col = index_converter.get_ng_indices(m_inds=m)
-    coo = sp.coo_matrix(
-        (data.astype(dtype), (row.astype(N_CELLS_DATATYPE), col.astype(N_GENES_DATATYPE))),
-        shape=index_converter.matrix_shape,
-        dtype=dtype,
-    )
-    coo.sum_duplicates()
-    return coo.tocsr()
+        _estimate_via_sql_to_parquet(noise_log_prob_coo, query, output_path, duckdb_memory_limit)
 
 
 def _register_posterior(
     conn: "duckdb.DuckDBPyConnection",
-    source: "PosteriorSource",
-    index_converter: "IndexConverter",
+    source: Path,
 ) -> None:
-    """Register the posterior data as a DuckDB relation named 'posterior'.
-
-    When *source* is a :class:`pathlib.Path` the parquet file is registered as
-    a zero-copy view.  When *source* is a :class:`scipy.sparse.coo_matrix` the
-    matrix is converted to a PyArrow Table and registered in-process.  Column
-    'c' contains absolute noise counts in both cases.
-    """
-    if isinstance(source, Path):
-        conn.execute(f"CREATE OR REPLACE VIEW posterior AS SELECT * FROM read_parquet('{source}')")
-    else:
-        # COO matrix path: build Arrow table from the COO
-        coo = source
-        rows = coo.row.astype("int32")
-        cols = coo.col.astype("int16")
-        data = coo.data.astype("float32")
-        cell_ids, gene_ids = index_converter.get_ng_indices(m_inds=rows)
-        table = pa.table(
-            {
-                "cell_id": pa.array(cell_ids.astype("int32"), type=pa.int32()),
-                "gene_id": pa.array(gene_ids.astype("int32"), type=pa.int32()),
-                "c": pa.array(cols, type=pa.int16()),
-                "log_prob": pa.array(data, type=pa.float32()),
-                "regularized": pa.array(np.zeros(len(rows), dtype=bool), type=pa.bool_()),
-            }
-        )
-        conn.register("posterior", table)
+    """Register the posterior parquet as a DuckDB view named 'posterior'."""
+    conn.execute(f"CREATE OR REPLACE VIEW posterior AS SELECT * FROM read_parquet('{source}')")
 
 
 def _ng_arrays_to_csr(
@@ -514,48 +192,8 @@ def _ng_arrays_to_csr(
     return coo.tocsr()
 
 
-def _estimate_via_sql(
-    source: "PosteriorSource",
-    index_converter: "IndexConverter",
-    query: str,
-    dtype=COUNT_DATATYPE,
-    duckdb_memory_limit: Optional[str] = None,
-) -> sp.csr_matrix:
-    """Register the posterior source and run a SQL estimation query.
-
-    Args:
-        source: Path to a parquet file, or a COO sparse matrix.
-        index_converter: Determines output matrix shape.
-        query: SQL selecting columns (cell_id, gene_id, noise_count).
-        dtype: Data type for output CSR values.
-        duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'). When None,
-            DuckDB auto-detects (~80% of system RAM).
-
-    Returns:
-        Estimated noise count CSR matrix.
-    """
-    conn = duckdb.connect()
-    # When the source is a parquet file, spill to its parent directory rather
-    # than /tmp, which may be a RAM-backed tmpfs inside Docker containers.
-    if isinstance(source, Path):
-        tmp_dir = str(source.parent).replace("'", "''")
-        conn.execute(f"SET temp_directory='{tmp_dir}'")
-    if duckdb_memory_limit is not None:
-        conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
-    _register_posterior(conn, source, index_converter)
-    df = conn.execute(query).df()
-    return _ng_arrays_to_csr(
-        cell_ids=df["cell_id"].values,
-        gene_ids=df["gene_id"].values,
-        data=df["noise_count"].values.astype(dtype),
-        shape=index_converter.matrix_shape,
-        dtype=dtype,
-    )
-
-
 def _estimate_via_sql_to_parquet(
-    source: "PosteriorSource",
-    index_converter: "IndexConverter",
+    source: Path,
     query: str,
     output_path: Path,
     duckdb_memory_limit: Optional[str] = None,
@@ -567,19 +205,17 @@ def _estimate_via_sql_to_parquet(
     DataFrame is materialised, so peak memory is only DuckDB's working set.
 
     Args:
-        source: Path to posterior parquet, or a COO sparse matrix.
-        index_converter: Used to register the posterior source.
+        source: Path to posterior parquet.
         query: SQL selecting columns ``(cell_id, gene_id, noise_count)``.
         output_path: Destination parquet file.
         duckdb_memory_limit: DuckDB memory cap (e.g. ``'4GB'``).
     """
     conn = duckdb.connect()
-    if isinstance(source, Path):
-        tmp_dir = str(source.parent).replace("'", "''")
-        conn.execute(f"SET temp_directory='{tmp_dir}'")
+    tmp_dir = str(source.parent).replace("'", "''")
+    conn.execute(f"SET temp_directory='{tmp_dir}'")
     if duckdb_memory_limit is not None:
         conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
-    _register_posterior(conn, source, index_converter)
+    _register_posterior(conn, source)
     out_str = str(output_path).replace("'", "''")
     conn.execute(
         f"COPY (SELECT * FROM ({query}) ORDER BY gene_id, cell_id) "
@@ -588,81 +224,60 @@ def _estimate_via_sql_to_parquet(
 
 
 def estimate_mean_noise_per_gene(
-    source: "PosteriorSource",
+    source: Path,
     index_converter: "IndexConverter",
     duckdb_memory_limit: Optional[str] = None,
-    device: str = "cpu",
 ) -> np.ndarray:
     """Return total E[noise_count] per gene, summed over all cells.
 
-    When *source* is a parquet :class:`pathlib.Path`, a single aggregated
-    DuckDB query returns only *n_analyzed_genes* rows (~5k-10k), entirely
-    avoiding the large per-(cell, gene) DataFrame that
-    :meth:`Mean.estimate_noise` produces.  When *source* is a COO matrix,
-    falls back to :meth:`Mean.estimate_noise` followed by a column sum.
+    A single aggregated DuckDB query returns only *n_analyzed_genes* rows
+    (~5k-10k), entirely avoiding the large per-(cell, gene) DataFrame.
 
     Args:
-        source: Path to posterior parquet, or a COO sparse matrix.
+        source: Path to posterior parquet.
         index_converter: Determines output array length (``total_n_genes``).
         duckdb_memory_limit: DuckDB memory cap (e.g. ``'4GB'``).  When
             *None*, DuckDB auto-detects (~80 % of system RAM).
-        device: Used only for the COO fallback path (passed to
-            :meth:`Mean.estimate_noise`).
 
     Returns:
         mean_noise_per_gene: 1-D array of shape ``(total_n_genes,)`` where
             entry *g* is ``sum_over_cells(E[noise_count(cell, g)])``.
     """
-    if isinstance(source, Path):
-        # Single-pass aggregated query: DuckDB computes per-(cell,gene) means
-        # internally but returns only one row per gene.  For a parquet sorted
-        # by (gene_id, cell_id) DuckDB can process window partitions in a
-        # streaming fashion, keeping working memory proportional to the number
-        # of distinct c values per (cell, gene) rather than the full table.
-        query = """
-            WITH shifted AS (
-                SELECT
-                    cell_id,
-                    gene_id,
-                    c,
-                    EXP(log_prob - MAX(log_prob) OVER (PARTITION BY cell_id, gene_id)) AS prob_raw
-                FROM posterior
-                WHERE NOT regularized
-            ),
-            normalized AS (
-                SELECT
-                    cell_id,
-                    gene_id,
-                    c,
-                    prob_raw / SUM(prob_raw) OVER (PARTITION BY cell_id, gene_id) AS prob
-                FROM shifted
-            )
+    query = """
+        WITH shifted AS (
             SELECT
+                cell_id,
                 gene_id,
-                SUM(CAST(c AS DOUBLE) * prob) AS total_mean_noise
-            FROM normalized
-            GROUP BY gene_id
-        """
-        conn = duckdb.connect()
-        tmp_dir = str(source.parent).replace("'", "''")
-        conn.execute(f"SET temp_directory='{tmp_dir}'")
-        if duckdb_memory_limit is not None:
-            conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
-        _register_posterior(conn, source, index_converter)
-        df = conn.execute(query).df()
-        result = np.zeros(index_converter.total_n_genes, dtype=np.float64)
-        if len(df) > 0:
-            result[df["gene_id"].values.astype(np.int32)] = df["total_mean_noise"].values
-        return result
-    else:
-        # COO path: the posterior is already in memory (e.g. from a PRmu
-        # regularization subset).  Use the Mean estimator and sum over cells.
-        estimator = Mean(index_converter=index_converter)
-        mean_noise_csr = estimator.estimate_noise(
-            noise_log_prob_coo=source,
-            device=device,
+                c,
+                EXP(log_prob - MAX(log_prob) OVER (PARTITION BY cell_id, gene_id)) AS prob_raw
+            FROM posterior
+            WHERE NOT regularized
+        ),
+        normalized AS (
+            SELECT
+                cell_id,
+                gene_id,
+                c,
+                prob_raw / SUM(prob_raw) OVER (PARTITION BY cell_id, gene_id) AS prob
+            FROM shifted
         )
-        return np.asarray(mean_noise_csr.sum(axis=0)).squeeze()
+        SELECT
+            gene_id,
+            SUM(CAST(c AS DOUBLE) * prob) AS total_mean_noise
+        FROM normalized
+        GROUP BY gene_id
+    """
+    conn = duckdb.connect()
+    tmp_dir = str(source.parent).replace("'", "''")
+    conn.execute(f"SET temp_directory='{tmp_dir}'")
+    if duckdb_memory_limit is not None:
+        conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    _register_posterior(conn, source)
+    df = conn.execute(query).df()
+    result = np.zeros(index_converter.total_n_genes, dtype=np.float64)
+    if len(df) > 0:
+        result[df["gene_id"].values.astype(np.int32)] = df["total_mean_noise"].values
+    return result
 
 
 class MultipleChoiceKnapsack(EstimationMethod):
@@ -674,7 +289,7 @@ class MultipleChoiceKnapsack(EstimationMethod):
 
     def estimate_noise_to_parquet(
         self,
-        noise_log_prob_coo: "PosteriorSource",
+        noise_log_prob_coo: Path,
         output_path: Path,
         noise_targets_per_gene: Optional[np.ndarray] = None,
         duckdb_memory_limit: Optional[str] = None,
@@ -695,8 +310,6 @@ class MultipleChoiceKnapsack(EstimationMethod):
             duckdb_memory_limit: DuckDB memory cap.
             verbose: Log intermediate DuckDB results.
         """
-        if not isinstance(noise_log_prob_coo, Path):
-            raise NotImplementedError("estimate_noise_to_parquet only supports parquet source")
         assert noise_targets_per_gene is not None, (
             "noise_targets_per_gene is required for MCKP.estimate_noise_to_parquet"
         )
@@ -708,7 +321,7 @@ class MultipleChoiceKnapsack(EstimationMethod):
         conn.execute(f"SET temp_directory='{tmp_dir}'")
         if duckdb_memory_limit is not None:
             conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
-        _register_posterior(conn, noise_log_prob_coo, self.index_converter)
+        _register_posterior(conn, noise_log_prob_coo)
 
         # Step 1: MAP estimate
         map_df = conn.execute("""
@@ -836,345 +449,6 @@ class MultipleChoiceKnapsack(EstimationMethod):
             f"ORDER BY m.gene_id, m.cell_id"
             f") TO '{out_str}' (FORMAT PARQUET, COMPRESSION 'snappy')"
         )
-
-    def estimate_noise(
-        self,
-        noise_log_prob_coo: "PosteriorSource",
-        noise_targets_per_gene: Optional[np.ndarray] = None,
-        verbose: bool = False,
-        n_chunks: Optional[int] = None,
-        use_multiple_processes: bool = False,
-        duckdb_memory_limit: Optional[str] = None,
-        **kwargs,
-    ) -> sp.csr_matrix:
-        """Given the full probabilistic posterior, compute noise counts via MCKP.
-
-        Args:
-            noise_log_prob_coo: Either a (m, c) COO matrix with log probabilities,
-                or a Path to a posterior parquet file written by CellBender.
-                Column 'c' stores absolute noise counts in both cases.
-            noise_targets_per_gene: Integer noise count target per gene (required).
-            verbose: Print intermediate DuckDB results for debugging.
-            n_chunks: Ignored; DuckDB handles memory management internally.
-            use_multiple_processes: Ignored; DuckDB is multi-threaded internally.
-            duckdb_memory_limit: DuckDB memory cap (e.g. '8GB'). DuckDB spills to
-                disk when this limit is reached. When None, DuckDB auto-detects
-                (~80% of system RAM).
-
-        Returns:
-            noise_count_csr: Estimated noise count CSR matrix.
-        """
-        assert noise_targets_per_gene is not None, (
-            "noise_targets_per_gene is required for MultipleChoiceKnapsack.estimate_noise"
-        )
-
-        t0 = time.time()
-
-        conn = duckdb.connect()
-        # When the source is a parquet file, spill to its parent directory rather
-        # than /tmp, which may be a RAM-backed tmpfs inside Docker containers.
-        if isinstance(noise_log_prob_coo, Path):
-            tmp_dir = str(noise_log_prob_coo.parent).replace("'", "''")
-            conn.execute(f"SET temp_directory='{tmp_dir}'")
-        if duckdb_memory_limit is not None:
-            conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
-        _register_posterior(conn, noise_log_prob_coo, self.index_converter)
-
-        # Step 1: MAP estimate — argmax of log_prob per (cell_id, gene_id)
-        map_df = conn.execute("""
-            SELECT
-                cell_id,
-                gene_id,
-                CAST(argmax(c, log_prob) AS INTEGER) AS map_c
-            FROM posterior
-            WHERE NOT regularized
-            GROUP BY cell_id, gene_id
-        """).df()
-
-        if verbose:
-            logger.debug("MAP head:\n%s", map_df.head(10).to_string())
-
-        # MAP noise counts per gene ('c' is already absolute)
-        map_csr = _ng_arrays_to_csr(
-            cell_ids=map_df["cell_id"].values,
-            gene_ids=map_df["gene_id"].values,
-            data=map_df["map_c"].values.astype(COUNT_DATATYPE),
-            shape=self.index_converter.matrix_shape,
-        )
-        map_noise_per_gene = np.asarray(map_csr.sum(axis=0)).squeeze()
-        additional = (noise_targets_per_gene - map_noise_per_gene).astype(int)
-        step_dir = np.sign(additional).astype(np.int32)
-        topk = np.abs(additional).astype(np.int64)
-
-        # Step 2: Build gene-level targets table
-        all_gene_ids = np.arange(self.index_converter.total_n_genes, dtype=np.int32)
-        gene_targets_df = pd.DataFrame(
-            {
-                "gene_id": all_gene_ids,
-                "step_direction": step_dir,
-                "topk": topk,
-            }
-        )
-        gene_targets_df = gene_targets_df[gene_targets_df["step_direction"] != 0].reset_index(drop=True)
-
-        if len(gene_targets_df) == 0:
-            logger.info("MCKP: MAP already matches targets for all genes.")
-            logger.info("Total MCKP time = %.2f sec", time.time() - t0)
-            return map_csr
-
-        conn.register("gene_targets", gene_targets_df)
-        conn.register("map_estimates", map_df[["cell_id", "gene_id", "map_c"]])
-
-        if verbose:
-            logger.debug(
-                "Positive-step genes: %d  Negative-step genes: %d",
-                (step_dir > 0).sum(),
-                (step_dir < 0).sum(),
-            )
-
-        # Step 3: Compute deltas and select cheapest topk steps per gene
-        steps_df = conn.execute("""
-            WITH directed AS (
-                SELECT
-                    p.cell_id,
-                    p.gene_id,
-                    p.c,
-                    p.log_prob,
-                    t.step_direction,
-                    t.topk,
-                    m.map_c,
-                    LAG(p.log_prob)  OVER w AS lag_lp,
-                    LEAD(p.log_prob) OVER w AS lead_lp
-                FROM posterior p
-                JOIN gene_targets  t ON p.gene_id = t.gene_id
-                JOIN map_estimates m ON p.cell_id  = m.cell_id
-                                    AND p.gene_id  = m.gene_id
-                WHERE NOT p.regularized
-                  AND (
-                        (t.step_direction =  1 AND p.c >= m.map_c)
-                     OR (t.step_direction = -1 AND p.c <= m.map_c)
-                  )
-                WINDOW w AS (PARTITION BY p.cell_id, p.gene_id ORDER BY p.c)
-            ),
-            deltas AS (
-                SELECT
-                    cell_id,
-                    gene_id,
-                    step_direction,
-                    topk,
-                    ABS(
-                        CASE WHEN step_direction =  1 THEN log_prob - lag_lp
-                             ELSE                          log_prob - lead_lp
-                        END
-                    ) AS delta
-                FROM directed
-                WHERE (step_direction =  1 AND lag_lp  IS NOT NULL)
-                   OR (step_direction = -1 AND lead_lp IS NOT NULL)
-            ),
-            ranked AS (
-                SELECT
-                    cell_id,
-                    gene_id,
-                    step_direction,
-                    topk,
-                    ROW_NUMBER() OVER (PARTITION BY gene_id ORDER BY delta) AS rn
-                FROM deltas
-            )
-            SELECT
-                cell_id,
-                gene_id,
-                CAST(COUNT(*) AS INTEGER) * any_value(step_direction) AS step_counts
-            FROM ranked
-            WHERE rn <= topk
-            GROUP BY cell_id, gene_id
-        """).df()
-
-        if verbose:
-            logger.debug("Steps head:\n%s", steps_df.head(10).to_string())
-
-        logger.info("Total MCKP estimation time = %.2f sec", time.time() - t0)
-
-        if len(steps_df) == 0:
-            return map_csr
-
-        steps_csr = _ng_arrays_to_csr(
-            cell_ids=steps_df["cell_id"].values,
-            gene_ids=steps_df["gene_id"].values,
-            data=steps_df["step_counts"].values,
-            shape=self.index_converter.matrix_shape,
-        )
-        return map_csr + steps_csr
-
-
-def chunked_iterator(
-    coo: sp.coo_matrix, max_dense_batch_size_GB: float = 1.0, n_counts_max: int = 20
-) -> Generator[Tuple[sp.coo_matrix, np.ndarray, np.ndarray], None, None]:
-    """Return an iterator which yields the full dataset in chunks.
-
-    NOTE: Idea is to prevent memory overflow. The use case is for worst-case
-    scenario algorithms that have to make things into dense matrix chunks in
-    order to do their compute.
-
-    Args:
-        coo: Sparse COO matrix with rows as generalized 'm'-indices and
-            columns as absolute noise count values.
-        max_dense_batch_size_GB: Size of a batch on disk, in gigabytes.
-        n_counts_max: Maximum number of distinct noise count values per row,
-            used to estimate the dense batch size.
-
-    Returns:
-        A generator that yields compact COO sparse matrices until the whole
-        dataset has been yielded. Each tuple is
-            (chunk_coo, unique_row_values, unique_col_values)
-        where unique_col_values are the absolute noise counts present in
-        the chunk, and chunk_coo uses compact 0-based indices into those
-        arrays.
-
-    """
-    n_elements_in_batch = max_dense_batch_size_GB * 1e9 / 4  # torch float32 is 4 bytes
-    batch_size = max(1, int(np.floor(n_elements_in_batch / n_counts_max)))
-
-    # COO rows are not necessarily contiguous or in order
-    unique_m_values = np.unique(coo.row)
-    n_chunks = max(1, len(unique_m_values) // batch_size)
-    row_m_value_chunks = np.array_split(unique_m_values, n_chunks)
-    coo_row_series = pd.Series(coo.row)
-
-    for row_m_values in row_m_value_chunks:
-        logic = coo_row_series.isin(set(row_m_values))
-        # Map these row values to a compact set of unique integers
-        unique_row_values, rows = np.unique(coo.row[logic], return_inverse=True)
-        unique_col_values, cols = np.unique(coo.col[logic], return_inverse=True)
-        chunk_coo = sp.coo_matrix(
-            (coo.data[logic], (rows, cols)),
-            shape=(len(unique_row_values), len(unique_col_values)),
-        )
-        yield (chunk_coo, unique_row_values, unique_col_values)
-
-
-def apply_function_dense_chunks(
-    noise_log_prob_coo: sp.coo_matrix,
-    fun: Callable[..., torch.Tensor],
-    device: str = "cpu",
-    n_counts_max: int = 20,
-    **kwargs,
-) -> Dict[str, np.ndarray]:
-    """Uses chunked_iterator to densify chunked portions of a COO sparse
-    matrix and then applies a function to the dense chunks, keeping track
-    of the results per row.
-
-    NOTE: The function should produce one value per row of the dense matrix.
-          The COO should contain log probability in data, with absolute noise
-          counts as column indices.
-
-    Args:
-        noise_log_prob_coo: The posterior noise count log prob data structure,
-            indexed by 'm' as rows; columns are absolute noise counts.
-        fun: Pytorch function that operates on a dense tensor and produces
-            one value per row. Must accept col_values as a keyword argument
-            (a float32 tensor of the absolute noise count for each compact
-            column in the chunk).
-        device: ['cpu', 'cuda'] - whether to perform the pytorch operation.
-        n_counts_max: Maximum distinct noise count values per row; used for
-            batch-size estimation.
-        **kwargs: Passed to fun
-
-    Returns:
-        Dict containing
-            'm': np.ndarray of indices
-            'result': the values computed by the function
-
-    """
-    array_length = len(np.unique(noise_log_prob_coo.row))
-
-    m = np.zeros(array_length, dtype=np.uint64)
-    out = np.zeros(array_length)
-    a = 0
-
-    for coo, row, col in chunked_iterator(coo=noise_log_prob_coo, n_counts_max=n_counts_max):
-        dense_tensor = torch.tensor(log_prob_sparse_to_dense(coo)).to(device)
-        if torch.numel(dense_tensor) == 0:
-            # github issue 207
-            continue
-        col_values = torch.tensor(col, dtype=dense_tensor.dtype).to(device)
-        s = fun(dense_tensor, col_values=col_values, **kwargs)
-        if s.ndim == 0:
-            # avoid "TypeError: len() of a 0-d tensor"
-            len_s = 1
-        else:
-            len_s = len(s)
-        m[a : (a + len_s)] = row
-        out[a : (a + len_s)] = s.detach().cpu().numpy()
-        a = a + len_s
-
-    return {"m": m, "result": out}
-
-
-def pandas_grouped_apply(
-    coo: sp.coo_matrix,
-    fun: Callable[[pd.DataFrame], Union[int, float]],
-    extra_data: Optional[Dict[str, np.ndarray]] = None,
-    sort_first: bool = False,
-    parallel: bool = False,
-) -> Dict[str, np.ndarray]:
-    """Apply function on a sparse COO format (noise log probs) to compute output
-    noise counts using pandas groupby and apply operations on CPU.
-
-    TODO: consider numpy-groupies or np.ufunc.reduceat or similar
-    https://stackoverflow.com/questions/31790819/scipy-sparse-csr-matrix-how-to-get-top-ten-values-and-indices
-
-    Args:
-        coo: COO data structure: (m, c) with 'm'-indexing.
-        fun: Function to be applied with pandas .apply(): turns
-            all the values for a matrix entry (m, :) into one number.
-        extra_data: To include extra information other than 'm', 'c', and the
-            'log_prob', you can pass in a dict here with array values the same
-            length as 'm' and in the same order.
-        sort_first: Sort the whole dataframe by ['m', 'c'] before applying
-            function (much faster than sorting inside the function call).
-        parallel: Use multiprocessing to run on all cores. This is 4x slower for
-            a dataset of 300 cells.  Not clear if it's faster for larger data.
-
-    Returns:
-        output_csr: The aggregated sparse matrix, in row format
-    """
-    df = pd.DataFrame(data={"m": coo.row, "c": coo.col, "log_prob": coo.data})
-    if extra_data is not None:
-        for k, v in extra_data.items():
-            df[k] = v
-    if sort_first:
-        df = df.sort_values(by=["m", "c"], ascending=[True, True])
-    if parallel:
-        m, result_per_m = _parallel_pandas_apply(df_grouped=df.groupby("m"), fun=fun)
-    else:
-        df = df.groupby("m").apply(fun).reset_index()
-        m = df["m"].values
-        result_per_m = df[0].values
-    return {"m": m, "result": result_per_m}
-
-
-def _parallel_pandas_apply(
-    df_grouped: pd.core.groupby.DataFrameGroupBy, fun: Callable[[pd.DataFrame], Union[int, float]]
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Use multiprocessing to apply a function to a grouped dataframe in pandas.
-
-    Args:
-        df_grouped: Grouped dataframe, as in df.groupby('m')
-        fun: Function to be applied to dataframe, as in df.groupby('m').apply(fun)
-
-    Returns:
-        Tuple of (groupby_value, groupby_apply_output_for_each_value)
-
-    NOTE: see https://stackoverflow.com/questions/26187759/parallelize-apply-after-pandas-groupby
-    """
-    groupby_val, group_df_list = zip(*[(group_val, group_df) for group_val, group_df in df_grouped])
-    with mp.Pool(mp.cpu_count()) as p:
-        output_list = p.map(fun, group_df_list)
-    return np.array(groupby_val), np.array(output_list)
-
-
-def _subset_coo(coo: sp.coo_matrix, logic: np.ndarray) -> sp.coo_matrix:
-    return sp.coo_matrix((coo.data[logic], (coo.row[logic], coo.col[logic])))
 
 
 def timestamp() -> str:

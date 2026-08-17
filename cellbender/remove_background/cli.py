@@ -179,17 +179,11 @@ class CLI(AbstractCLI):
             )
             sys.stdout.flush()  # Write immediately
 
-        # Posterior regularization checking.
+        # Estimator checking.
         if args.cdf_threshold_q is not None:
             assert (args.cdf_threshold_q >= 0.0) and (args.cdf_threshold_q <= 1.0), (
                 "Argument --q must be in range [0, 1] since it is a CDF threshold."
             )
-        if args.posterior_regularization == "PRq":
-            # We need q for the CDF threshold estimator.
-            assert args.prq_alpha is not None, (
-                "Input argument --alpha must be specified when using --posterior-regularization PRq"
-            )
-
         # Estimator checking.
         if args.estimator == "cdf":
             # We need q for the CDF threshold estimator.
