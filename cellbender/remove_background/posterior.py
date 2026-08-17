@@ -197,7 +197,7 @@ def sort_and_save_posterior(
     """
     if posterior._sort_needed:
         assert posterior._posterior_parquet_path is not None
-        logger.info("Starting posterior parquet sort (this may take a while)...")
+        logger.info("Starting posterior parquet sort...")
         sort_posterior_parquet(
             posterior._posterior_parquet_path,
             duckdb_memory_limit=args.duckdb_memory_limit,
@@ -1650,6 +1650,7 @@ def compute_mean_target_removal_as_function(
     n_cells: int,
     device: str,
     per_gene: bool,
+    duckdb_memory_limit: Optional[str] = None,
 ) -> Callable[[float], torch.Tensor]:
     """Given the noise count posterior, return a function that computes target
     removal (either overall or per-gene) as a function of FPR.
@@ -1670,6 +1671,8 @@ def compute_mean_target_removal_as_function(
             raw_count_csr_for_cells
         device: 'cpu' or 'cuda'
         per_gene: True to come up with one target per gene
+        duckdb_memory_limit: DuckDB memory cap for the SQL mean estimation
+            (e.g. '4GB'). When None, DuckDB auto-detects (~80% of system RAM).
 
     Returns:
         target_removal_scaled_per_cell: Noise count removal target
@@ -1679,27 +1682,41 @@ def compute_mean_target_removal_as_function(
     # TODO: s1.h5 with FPR 0.99 only removes 50% of signal
 
     # Compute the expected noise using mean summarization.
+    logger.debug("Computing mean noise counts via DuckDB SQL...")
     estimator = Mean(index_converter=index_converter)
     mean_noise_csr = estimator.estimate_noise(
         noise_log_prob_coo=noise_count_posterior_coo,
         device=device,
+        duckdb_memory_limit=duckdb_memory_limit,
     )
-    logger.debug(f"Total counts in raw matrix for cells = {raw_count_csr_for_cells.sum()}")
-    logger.debug(f"Total noise counts from mean noise estimator = {mean_noise_csr.sum()}")
+    logger.debug("Mean noise CSR computed. Reducing to per-gene sums...")
 
-    # Compute the target removal.
-    approx_signal_csr = raw_count_csr_for_cells - mean_noise_csr
-    logger.debug(f"Approximate signal has total counts = {approx_signal_csr.sum()}")
+    # Reduce the full CSR matrices to per-gene 1D arrays immediately so the
+    # closure captures only ~240 KB instead of ~200-400 MB of sparse matrices.
+    # approx_signal_csr is never constructed as a full matrix: raw count sums
+    # minus mean noise sums gives the same per-gene values at a tiny fraction
+    # of the peak memory cost.
+    mean_noise_per_gene = np.array(mean_noise_csr.sum(axis=0)).squeeze()
+    mean_noise_total = float(mean_noise_csr.sum())
+    logger.debug(f"Total noise counts from mean noise estimator = {mean_noise_total}")
+    del mean_noise_csr
+    gc.collect()
+
+    raw_count_per_gene = np.array(raw_count_csr_for_cells.sum(axis=0)).squeeze()
+    raw_count_total = float(raw_count_csr_for_cells.sum())
+    logger.debug(f"Total counts in raw matrix for cells = {raw_count_total}")
+
+    approx_signal_per_gene = raw_count_per_gene - mean_noise_per_gene
+    approx_signal_total = raw_count_total - mean_noise_total
+    logger.debug(f"Approximate signal has total counts = {approx_signal_total}")
     logger.debug(f"Number of cells = {n_cells}")
 
     def _target_fun(fpr: float) -> torch.Tensor:
         """The function which gets returned"""
         if per_gene:
-            target = np.array(mean_noise_csr.sum(axis=0)).squeeze()
-            target = target + fpr * np.array(approx_signal_csr.sum(axis=0)).squeeze()
+            target = mean_noise_per_gene + fpr * approx_signal_per_gene
         else:
-            target = mean_noise_csr.sum()
-            target = target + fpr * approx_signal_csr.sum()
+            target = mean_noise_total + fpr * approx_signal_total
 
         # Return target scaled to be per-cell.
         return torch.tensor(target / n_cells).to(device)

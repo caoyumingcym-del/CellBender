@@ -410,6 +410,11 @@ def _estimate_via_sql(
         Estimated noise count CSR matrix.
     """
     conn = duckdb.connect()
+    # When the source is a parquet file, spill to its parent directory rather
+    # than /tmp, which may be a RAM-backed tmpfs inside Docker containers.
+    if isinstance(source, Path):
+        tmp_dir = str(source.parent).replace("'", "''")
+        conn.execute(f"SET temp_directory='{tmp_dir}'")
     if duckdb_memory_limit is not None:
         conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
     _register_posterior(conn, source, index_converter)
@@ -464,6 +469,11 @@ class MultipleChoiceKnapsack(EstimationMethod):
         t0 = time.time()
 
         conn = duckdb.connect()
+        # When the source is a parquet file, spill to its parent directory rather
+        # than /tmp, which may be a RAM-backed tmpfs inside Docker containers.
+        if isinstance(noise_log_prob_coo, Path):
+            tmp_dir = str(noise_log_prob_coo.parent).replace("'", "''")
+            conn.execute(f"SET temp_directory='{tmp_dir}'")
         if duckdb_memory_limit is not None:
             conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
         _register_posterior(conn, noise_log_prob_coo, self.index_converter)
