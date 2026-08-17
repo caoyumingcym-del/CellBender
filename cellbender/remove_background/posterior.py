@@ -41,9 +41,9 @@ from cellbender.remove_background.data.io import (
 from cellbender.remove_background.estimation import (
     MAP,
     EstimationMethod,
-    Mean,
     PosteriorSource,
     apply_function_dense_chunks,
+    estimate_mean_noise_per_gene,
 )
 from cellbender.remove_background.model import calculate_lambda, calculate_mu
 from cellbender.remove_background.sparse_utils import (
@@ -1681,26 +1681,20 @@ def compute_mean_target_removal_as_function(
 
     # TODO: s1.h5 with FPR 0.99 only removes 50% of signal
 
-    # Compute the expected noise using mean summarization.
-    logger.debug("Computing mean noise counts via DuckDB SQL...")
-    estimator = Mean(index_converter=index_converter)
-    mean_noise_csr = estimator.estimate_noise(
-        noise_log_prob_coo=noise_count_posterior_coo,
-        device=device,
+    # Compute per-gene total expected noise counts.  When the source is a
+    # parquet Path (the normal run path), a single aggregated DuckDB query
+    # returns only n_analyzed_genes rows (~5k-10k), completely avoiding the
+    # large per-(cell, gene) DataFrame and the intermediate CSR matrix that
+    # Mean.estimate_noise would otherwise produce.
+    logger.debug("Computing per-gene mean noise totals...")
+    mean_noise_per_gene = estimate_mean_noise_per_gene(
+        source=noise_count_posterior_coo,
+        index_converter=index_converter,
         duckdb_memory_limit=duckdb_memory_limit,
+        device=device,
     )
-    logger.debug("Mean noise CSR computed. Reducing to per-gene sums...")
-
-    # Reduce the full CSR matrices to per-gene 1D arrays immediately so the
-    # closure captures only ~240 KB instead of ~200-400 MB of sparse matrices.
-    # approx_signal_csr is never constructed as a full matrix: raw count sums
-    # minus mean noise sums gives the same per-gene values at a tiny fraction
-    # of the peak memory cost.
-    mean_noise_per_gene = np.array(mean_noise_csr.sum(axis=0)).squeeze()
-    mean_noise_total = float(mean_noise_csr.sum())
+    mean_noise_total = float(mean_noise_per_gene.sum())
     logger.debug(f"Total noise counts from mean noise estimator = {mean_noise_total}")
-    del mean_noise_csr
-    gc.collect()
 
     raw_count_per_gene = np.array(raw_count_csr_for_cells.sum(axis=0)).squeeze()
     raw_count_total = float(raw_count_csr_for_cells.sum())

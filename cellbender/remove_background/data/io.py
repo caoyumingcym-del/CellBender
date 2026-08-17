@@ -325,6 +325,380 @@ def _parquet_to_coo(
     )
 
 
+class IncrementalH5Writer:
+    """Context manager for streaming a sparse CSC count matrix to a CellRanger-format HDF5 file.
+
+    Writes gene column by gene column using PyTables extensible arrays so that
+    the full data/indices arrays never need to be held in RAM simultaneously.
+
+    Usage::
+
+        with IncrementalH5Writer(output_file, ...) as writer:
+            for gene_idx in range(n_genes):
+                bc_inds, counts = get_gene_data(gene_idx)   # small arrays
+                writer.append_gene(gene_idx, bc_inds, counts)
+
+    The ``indptr`` array (length ``n_genes + 1``) is written at ``__exit__``
+    time, when the cumulative non-zero count is known for every gene.
+    """
+
+    def __init__(
+        self,
+        output_file: str,
+        n_genes: int,
+        n_barcodes: int,
+        gene_names: np.ndarray,
+        barcodes: np.ndarray,
+        gene_ids: Optional[np.ndarray] = None,
+        feature_types: Optional[np.ndarray] = None,
+        genomes: Optional[np.ndarray] = None,
+        local_latents: Optional[Dict[str, Optional[np.ndarray]]] = None,
+        global_latents: Optional[Dict[str, Optional[np.ndarray]]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        self.output_file = output_file
+        self.n_genes = n_genes
+        self.n_barcodes = n_barcodes
+        self.gene_names = gene_names
+        self.barcodes = barcodes
+        self.gene_ids = gene_ids
+        self.feature_types = feature_types
+        self.genomes = genomes
+        self.local_latents = local_latents or {}
+        self.global_latents = global_latents or {}
+        self.metadata = metadata or {}
+
+        self._f = None
+        self._group = None
+        self._data_arr = None
+        self._indices_arr = None
+        self._indptr: List[int] = [0]  # cumulative nnz per gene column
+
+    def __enter__(self) -> "IncrementalH5Writer":
+        filters = tables.Filters(complevel=1, complib='zlib', shuffle=True)
+        filter_noshuffle = tables.Filters(complevel=1, complib='zlib', shuffle=False)
+
+        self._f = tables.open_file(self.output_file, "w", title="CellBender remove-background output")
+        f = self._f
+        assert f is not None  # mypy
+
+        # Feature group (CellRanger v3 format — the only format we write).
+        group = f.create_group("/", "matrix", "Counts after background correction")
+        self._group = group
+        feature_group = f.create_group(group, "features", "Genes and other features measured")
+
+        gene_ids = self.gene_ids if self.gene_ids is not None else np.array([f'NA_{i}' for i in range(self.n_genes)])
+        ft = self.feature_types if self.feature_types is not None else np.array(['Gene Expression'] * self.n_genes)
+        genomes = self.genomes if self.genomes is not None else np.array(['NA'] * self.n_genes)
+
+        f.create_carray(feature_group, "name", obj=self.gene_names, filters=filters)
+        f.create_carray(feature_group, "id", obj=gene_ids, filters=filters)
+        f.create_carray(feature_group, "feature_type", obj=ft, filters=filters)
+        f.create_carray(feature_group, "genome", obj=genomes, filters=filters)
+        f.create_carray(group, "barcodes", obj=self.barcodes, filters=filter_noshuffle)
+
+        # Extensible arrays for non-zeros (gene-column-major order = CellRanger CSC transposed).
+        self._data_arr = f.create_earray(group, "data", tables.Int32Atom(), shape=(0,), filters=filters)
+        self._indices_arr = f.create_earray(group, "indices", tables.Int32Atom(), shape=(0,), filters=filters)
+
+        return self
+
+    def append_barcode(self, barcode_idx: int, gene_indices: np.ndarray, counts: np.ndarray) -> None:
+        """Append non-zero entries for one barcode column.
+
+        CellRanger H5 stores a CSC matrix of shape ``(n_genes, n_barcodes)``,
+        so barcodes are the CSC columns.  Call this method once per barcode
+        in ascending order; pass empty arrays for barcodes with no counts.
+
+        Args:
+            barcode_idx: Output row index (0-based, position in the written
+                barcodes array).  Not actually stored — used only for ordering.
+            gene_indices: Absolute gene indices of the non-zeros for this barcode.
+            counts: Non-zero count values for this barcode.
+        """
+        assert self._data_arr is not None and self._indices_arr is not None
+        if len(counts) > 0:
+            self._data_arr.append(counts.astype(np.int32))
+            self._indices_arr.append(gene_indices.astype(np.int32))
+        self._indptr.append(self._indptr[-1] + len(counts))
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._f is None:
+            return
+        try:
+            if exc_type is None:
+                f = self._f
+                group = self._group
+                filters = tables.Filters(complevel=1, complib='zlib', shuffle=True)
+
+                # Pad indptr for any barcodes not covered by append_barcode calls.
+                last = self._indptr[-1]
+                while len(self._indptr) < self.n_barcodes + 1:
+                    self._indptr.append(last)
+
+                f.create_carray(group, "indptr", obj=np.array(self._indptr, dtype=np.int64), filters=filters)
+                # CellRanger convention: shape [n_genes, n_barcodes] — the stored
+                # CSC has genes as rows and barcodes as columns; anndata_from_h5
+                # reads this and transposes to get barcodes × genes.
+                f.create_carray(group, "shape", atom=tables.Int32Atom(),
+                                obj=np.array([self.n_genes, self.n_barcodes], dtype=np.int32), filters=filters)
+
+                # Local latent variables.
+                droplet_latent_group = f.create_group("/", "droplet_latents", "Latent variables per droplet")
+                for key, value in self.local_latents.items():
+                    if value is not None:
+                        f.create_carray(droplet_latent_group, key, obj=value, filters=filters)
+
+                # Global latent variables.
+                global_group = f.create_group("/", "global_latents", "Global latent variables")
+                for key, value in self.global_latents.items():
+                    if value is not None:
+                        f.create_array(global_group, key, value)
+
+                def _write_meta(f, grp, k, v):
+                    if v is None:
+                        return
+                    if isinstance(v, (list, np.ndarray)):
+                        f.create_array(grp, k, v)
+                    else:
+                        f.create_array(grp, k, [v])
+
+                metadata_group = f.create_group("/", "metadata", "Metadata")
+                for meta_key, meta_value in self.metadata.items():
+                    for k, v in unravel_dict(meta_key, meta_value).items():
+                        _write_meta(f, metadata_group, k, v)
+
+                logger.info(f"Succeeded in writing CellRanger format output to file {self.output_file}")
+        finally:
+            self._f.close()
+            self._f = None
+
+
+def compute_noise_totals_per_barcode(
+    noise_parquet_path: Path,
+    total_n_barcodes: int,
+    duckdb_memory_limit: Optional[str] = None,
+) -> np.ndarray:
+    """Aggregate total noise counts per barcode from the noise parquet.
+
+    Runs a single ``GROUP BY cell_id`` query in DuckDB — very fast since it
+    returns only one row per cell rather than one row per (cell, gene).
+
+    Args:
+        noise_parquet_path: Parquet with ``(cell_id, gene_id, noise_count)``
+            sorted by ``(gene_id, cell_id)``.
+        total_n_barcodes: Length of the output array.
+        duckdb_memory_limit: DuckDB memory cap.
+
+    Returns:
+        noise_per_barcode: 1-D float64 array of shape ``(total_n_barcodes,)``.
+    """
+    import duckdb as _duckdb
+    conn = _duckdb.connect()
+    tmp_dir = str(noise_parquet_path.parent).replace("'", "''")
+    conn.execute(f"SET temp_directory='{tmp_dir}'")
+    if duckdb_memory_limit is not None:
+        conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    noise_str = str(noise_parquet_path).replace("'", "''")
+    df = conn.execute(
+        f"SELECT cell_id, SUM(noise_count) AS total_noise "
+        f"FROM read_parquet('{noise_str}') GROUP BY cell_id"
+    ).df()
+    result = np.zeros(total_n_barcodes, dtype=np.float64)
+    if len(df) > 0:
+        result[df["cell_id"].values.astype(np.int64)] = df["total_noise"].values
+    return result
+
+
+def stream_denoised_to_cellranger_h5(
+    noise_parquet_path: Path,
+    raw_count_matrix: "sp.csr_matrix",
+    output_file: str,
+    analyzed_gene_inds: np.ndarray,
+    cell_logic: np.ndarray,
+    analyzed_barcode_inds: np.ndarray,
+    gene_names: np.ndarray,
+    barcodes: np.ndarray,
+    gene_ids: Optional[np.ndarray] = None,
+    feature_types: Optional[np.ndarray] = None,
+    genomes: Optional[np.ndarray] = None,
+    local_latents: Optional[Dict[str, Optional[np.ndarray]]] = None,
+    global_latents: Optional[Dict[str, Optional[np.ndarray]]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    barcode_subset: Optional[np.ndarray] = None,
+    barcode_batch_size: int = 1000,
+    duckdb_memory_limit: Optional[str] = None,
+) -> np.ndarray:
+    """Compute denoised counts and write to CellRanger H5 barcode-by-barcode.
+
+    Workflow:
+    1. Re-sort the noise parquet by ``(cell_id, gene_id)`` using DuckDB so
+       that barcode-range queries are efficient via row-group min/max pushdown.
+    2. Iterate barcodes in ``barcode_subset`` in batches, fetching each
+       batch's noise counts from the re-sorted parquet.
+    3. For each barcode: subtract noise from raw (analyzed genes); keep raw
+       for non-analyzed genes; zero out non-cells.
+    4. Write barcode vectors incrementally to :class:`IncrementalH5Writer`.
+       The full denoised matrix is never held in RAM simultaneously.
+
+    The noise parquet uses *local* indices produced by ``estimate_noise_to_parquet``:
+    - ``cell_id``: index into ``analyzed_barcode_inds``
+    - ``gene_id``: index into ``analyzed_gene_inds``
+
+    Non-analysed genes use raw counts for cell barcodes (empty barcodes zeroed),
+    mirroring
+    :meth:`~SingleCellRNACountsDataset.restore_eliminated_features_in_cells`.
+
+    Args:
+        noise_parquet_path: Parquet with ``(cell_id, gene_id, noise_count)``
+            sorted by ``(gene_id, cell_id)`` (local indices).
+        raw_count_matrix: Full raw count matrix, shape
+            ``(total_barcodes, total_genes)`` — CSR or CSC.
+        output_file: Destination ``.h5`` path.
+        analyzed_gene_inds: Absolute gene indices included in analysis.
+        cell_logic: Boolean mask of length ``len(analyzed_barcode_inds)``
+            where True marks a cell.
+        analyzed_barcode_inds: Absolute barcode indices that were analysed.
+        gene_names: Gene name array of length ``total_genes``.
+        barcodes: Barcode names for the rows written.  When
+            ``barcode_subset`` is given this should already be the subset.
+        barcode_subset: Absolute barcode indices to include. ``None`` → all.
+        barcode_batch_size: Number of barcodes per DuckDB batch query.
+        duckdb_memory_limit: DuckDB memory cap.
+        local_latents, global_latents, metadata: Passed to
+            :class:`IncrementalH5Writer`.
+
+    Returns:
+        denoised_per_barcode: 1-D int64 array of total denoised counts per
+            output-row barcode, shape ``(len(barcode_subset),)``.
+    """
+    import duckdb as _duckdb
+
+    total_barcodes = raw_count_matrix.shape[0]
+    total_genes = raw_count_matrix.shape[1]
+    analyzed_gene_set = set(analyzed_gene_inds.tolist())
+
+    # Local → absolute index maps for the noise parquet lookups.
+    abs_to_local_gene: Dict[int, int] = {
+        int(analyzed_gene_inds[i]): i for i in range(len(analyzed_gene_inds))
+    }
+    abs_to_local_cell: Dict[int, int] = {
+        int(analyzed_barcode_inds[i]): i for i in range(len(analyzed_barcode_inds))
+    }
+    cell_absolute: set = set(analyzed_barcode_inds[cell_logic].tolist())
+
+    if barcode_subset is None:
+        barcode_subset = np.arange(total_barcodes, dtype=np.int64)
+    n_out_barcodes = len(barcode_subset)
+
+    denoised_per_barcode = np.zeros(n_out_barcodes, dtype=np.int64)
+    raw_csr = raw_count_matrix.tocsr()
+
+    # Step 1: Re-sort noise parquet by (cell_id, gene_id) so that per-barcode-batch
+    # DuckDB queries can skip row groups via min/max statistics.
+    bc_sorted_path = noise_parquet_path.parent / (noise_parquet_path.stem + "_bcsorted.parquet")
+    noise_str = str(noise_parquet_path).replace("'", "''")
+    bc_sorted_str = str(bc_sorted_path).replace("'", "''")
+    tmp_dir = str(noise_parquet_path.parent).replace("'", "''")
+
+    conn = _duckdb.connect()
+    conn.execute(f"SET temp_directory='{tmp_dir}'")
+    if duckdb_memory_limit is not None:
+        conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+
+    logger.debug("Re-sorting noise parquet by cell_id for streaming H5 write")
+    conn.execute(
+        f"COPY (SELECT * FROM read_parquet('{noise_str}') ORDER BY cell_id, gene_id)"
+        f" TO '{bc_sorted_str}' (FORMAT PARQUET, COMPRESSION 'snappy')"
+    )
+
+    # Step 2: Stream barcode-by-barcode, write to H5.
+    try:
+        with IncrementalH5Writer(
+            output_file=output_file,
+            n_genes=total_genes,
+            n_barcodes=n_out_barcodes,
+            gene_names=gene_names,
+            barcodes=barcodes,
+            gene_ids=gene_ids,
+            feature_types=feature_types,
+            genomes=genomes,
+            local_latents=local_latents,
+            global_latents=global_latents,
+            metadata=metadata,
+        ) as writer:
+            for batch_start in range(0, n_out_barcodes, barcode_batch_size):
+                batch_end = min(batch_start + barcode_batch_size, n_out_barcodes)
+                batch_bcs = barcode_subset[batch_start:batch_end]
+
+                # Collect local cell_ids for analyzed cells in this batch.
+                batch_local_ids: List[Optional[int]] = []
+                analyzed_local_in_batch: List[int] = []
+                for bc in batch_bcs:
+                    lid = abs_to_local_cell.get(int(bc))
+                    batch_local_ids.append(lid)
+                    if lid is not None and int(bc) in cell_absolute:
+                        analyzed_local_in_batch.append(lid)
+
+                # Query bc-sorted parquet for this batch's range of local cell_ids.
+                noise_by_cell: Dict[int, Dict[int, float]] = {}
+                if analyzed_local_in_batch:
+                    min_lid = min(analyzed_local_in_batch)
+                    max_lid = max(analyzed_local_in_batch)
+                    noise_df = conn.execute(
+                        f"SELECT cell_id, gene_id, noise_count "
+                        f"FROM read_parquet('{bc_sorted_str}') "
+                        f"WHERE cell_id >= {min_lid} AND cell_id <= {max_lid}"
+                    ).df()
+                    for row in noise_df.itertuples(index=False):
+                        cid = int(row.cell_id)
+                        if cid not in noise_by_cell:
+                            noise_by_cell[cid] = {}
+                        noise_by_cell[cid][int(row.gene_id)] = float(row.noise_count)
+                    del noise_df
+
+                for i, (bc, local_id) in enumerate(zip(batch_bcs.tolist(), batch_local_ids)):
+                    bc_int = int(bc)
+                    out_row = batch_start + i
+
+                    if bc_int not in cell_absolute:
+                        # Empty barcode → zero counts.
+                        writer.append_barcode(out_row, np.empty(0, np.int32), np.empty(0, np.int32))
+                        continue
+
+                    raw_row = raw_csr.getrow(bc_int)
+                    noise_dict = noise_by_cell.get(local_id, {}) if local_id is not None else {}
+
+                    gene_idx_out: List[int] = []
+                    cnts_out: List[int] = []
+
+                    for abs_g, raw_c in zip(raw_row.indices.tolist(), raw_row.data.tolist()):
+                        if abs_g in analyzed_gene_set:
+                            local_g = abs_to_local_gene[abs_g]
+                            noise_c = int(round(noise_dict.get(local_g, 0.0)))
+                            denoised = max(0, int(raw_c) - noise_c)
+                        else:
+                            denoised = int(raw_c)  # non-analyzed gene: keep raw for cells
+                        if denoised > 0:
+                            gene_idx_out.append(abs_g)
+                            cnts_out.append(denoised)
+                            denoised_per_barcode[out_row] += denoised
+
+                    writer.append_barcode(
+                        out_row,
+                        np.array(gene_idx_out, dtype=np.int32),
+                        np.array(cnts_out, dtype=np.int32),
+                    )
+    finally:
+        conn.close()
+        try:
+            bc_sorted_path.unlink()
+        except Exception:
+            logger.warning(f"Could not remove temp parquet: {bc_sorted_path}")
+
+    return denoised_per_barcode
+
+
 def _split_latents(
     latents: Dict[str, np.ndarray]
 ) -> tuple[Dict[str, np.ndarray], Dict[str, list]]:
