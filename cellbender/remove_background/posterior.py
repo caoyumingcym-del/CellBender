@@ -470,7 +470,6 @@ class Posterior:
                     gene_ids=genes_i.numpy().astype(np.int32),
                     c_vals=c_i_absolute,
                     log_probs=log_prob_i.detach().cpu().numpy().astype(np.float32),
-                    regularized=False,
                 )
 
                 ind += data.shape[0]
@@ -907,7 +906,6 @@ def compute_mean_target_removal_as_function(
     n_cells: int,
     device: str,
     per_gene: bool,
-    duckdb_memory_limit: Optional[str] = None,
 ) -> Callable[[float], torch.Tensor]:
     """Given the posterior parquet, return a function that computes target
     removal (either overall or per-gene) as a function of FPR.
@@ -925,8 +923,6 @@ def compute_mean_target_removal_as_function(
             raw_count_csr_for_cells
         device: 'cpu' or 'cuda' (retained for API compatibility)
         per_gene: True to come up with one target per gene
-        duckdb_memory_limit: DuckDB memory cap for the SQL mean estimation
-            (e.g. '4GB'). When None, DuckDB auto-detects (~80% of system RAM).
 
     Returns:
         target_removal_scaled_per_cell: Noise count removal target
@@ -939,7 +935,6 @@ def compute_mean_target_removal_as_function(
     mean_noise_per_gene = estimate_mean_noise_per_gene(
         source=noise_count_posterior_coo,
         n_genes=n_genes,
-        duckdb_memory_limit=duckdb_memory_limit,
     )
     mean_noise_total = float(mean_noise_per_gene.sum())
     logger.debug(f"Total noise counts from mean noise estimator = {mean_noise_total}")

@@ -61,7 +61,6 @@ def test_compute_mean_target_removal_as_function(tmp_path, fpr, per_gene):
             gene_ids=gene_ids_arr,
             c_vals=c_vals_arr,
             log_probs=log_probs_arr,
-            regularized=False,
         )
 
     # n_cells=5 total, 1 gene; count_matrix reflects the raw counts above.
@@ -112,7 +111,6 @@ def test_save_and_load(tmpdir_factory):
             gene_ids=gene_ids,
             c_vals=c_vals,
             log_probs=log_probs,
-            regularized=False,
         )
 
     latents = {"p": np.random.randn(100), "d": np.random.randn(100)}
@@ -168,7 +166,6 @@ def test_vi_model_freed_after_posterior_computation(tmpdir_factory):
             gene_ids=gene_ids,
             c_vals=c_vals,
             log_probs=log_probs,
-            regularized=False,
         )
 
     latents = {"p": np.ones(1) * 0.99, "d": np.ones(1) * 100.0}
@@ -205,7 +202,6 @@ def test_sort_posterior_parquet_uses_output_dir_as_tmpdir(tmpdir_factory):
             gene_ids=gene_ids,
             c_vals=c_vals,
             log_probs=log_probs,
-            regularized=False,
         )
 
     # Sort should complete without error and produce an ordered file.

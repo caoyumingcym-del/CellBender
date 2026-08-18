@@ -10,13 +10,18 @@ import pytest
 import scipy.sparse as sp
 import torch
 
-from cellbender.remove_background.data.io import POSTERIOR_SCHEMA, write_posterior_batch_to_parquet
+from cellbender.remove_background.data.io import (
+    POSTERIOR_SCHEMA,
+    _make_duckdb_conn,
+    write_posterior_batch_to_parquet,
+)
 from cellbender.remove_background.estimation import (
     MAP,
     Mean,
     MultipleChoiceKnapsack,
     SingleSample,
     ThresholdCDF,
+    estimate_mean_noise_per_gene,
 )
 from cellbender.remove_background.posterior import compute_mean_target_removal_as_function
 from cellbender.remove_background.sparse_utils import dense_to_sparse_op_torch, log_prob_sparse_to_dense
@@ -87,7 +92,6 @@ def log_prob_parquet(log_prob_coo_base, tmp_path_factory) -> Dict[str, Union[Pat
         gene_ids=gene_ids,
         c_vals=coo.col.astype(np.int32),
         log_probs=coo.data.astype(np.float32),
-        regularized=False,
     )
     writer.close()
 
@@ -200,7 +204,6 @@ def test_cdf_parquet_coalesce_fallback(tmp_path_factory):
         gene_ids=np.array([0, 0], dtype=np.int32),
         c_vals=np.array([5, 10], dtype=np.int32),
         log_probs=np.array([log_prob, log_prob], dtype=np.float32),
-        regularized=False,
     )
     writer.close()
 
@@ -226,7 +229,6 @@ def test_mean_parquet_numerical_stability(tmp_path_factory):
         gene_ids=np.zeros(2, dtype=np.int32),
         c_vals=cs,
         log_probs=log_probs,
-        regularized=False,
     )
     writer.close()
 
@@ -291,7 +293,6 @@ def mckp_parquet(log_prob_coo_base, tmp_path_factory) -> Dict:
         gene_ids=gene_ids,
         c_vals=new_coo.col.astype(np.int32),
         log_probs=new_data.astype(np.float32),
-        regularized=False,
     )
     writer.close()
 
@@ -347,7 +348,6 @@ def test_c_large_value_no_overflow(tmp_path_factory):
         gene_ids=np.zeros(2, dtype=np.int32),
         c_vals=c_vals,
         log_probs=log_probs,
-        regularized=False,
     )
     writer.close()
 
@@ -409,7 +409,6 @@ def test_mckp_multi_cell(tmp_path_factory):
         gene_ids=np.array(gene_ids, dtype=np.int32),
         c_vals=np.array(c_vals, dtype=np.int32),
         log_probs=np.array(log_probs, dtype=np.float32),
-        regularized=False,
     )
     writer.close()
 
@@ -445,7 +444,6 @@ def test_mckp_early_exit_when_map_matches_targets(tmp_path_factory):
         gene_ids=np.array([0, 0, 1, 1], dtype=np.int32),
         c_vals=np.array([2, 3, 4, 5], dtype=np.int32),
         log_probs=np.array([-1.0, -0.1, -1.0, -0.1], dtype=np.float32),
-        regularized=False,
     )
     writer.close()
 
@@ -480,7 +478,6 @@ def test_cdf_q_zero(tmp_path_factory):
         gene_ids=np.zeros(3, dtype=np.int32),
         c_vals=np.array([5, 10, 15], dtype=np.int32),
         log_probs=np.array([-3.0, -2.0, -0.1], dtype=np.float32),
-        regularized=False,
     )
     writer.close()
 
@@ -503,7 +500,6 @@ def test_cdf_q_one(tmp_path_factory):
         gene_ids=np.zeros(3, dtype=np.int32),
         c_vals=np.array([5, 10, 15], dtype=np.int32),
         log_probs=np.array([-3.0, -2.0, -0.1], dtype=np.float32),
-        regularized=False,
     )
     writer.close()
 
@@ -535,7 +531,6 @@ def test_gene_absent_from_posterior_is_absent_from_output(tmp_path_factory):
         gene_ids=np.zeros(2, dtype=np.int32),
         c_vals=np.array([0, 1], dtype=np.int32),
         log_probs=np.array([-0.5, -1.0], dtype=np.float32),
-        regularized=False,
     )
     writer.close()
 
@@ -544,3 +539,113 @@ def test_gene_absent_from_posterior_is_absent_from_output(tmp_path_factory):
     present_genes = set(df["gene_id"].tolist())
     assert present_genes == {0}, f"Only gene 0 should be in output, got {present_genes}"
     assert 1 not in present_genes, "Gene 1 has no posterior entries and must be absent from output"
+
+
+# ---------------------------------------------------------------------------
+# _make_duckdb_conn: auto memory limit
+# ---------------------------------------------------------------------------
+
+
+def test_make_duckdb_conn_auto_detects_memory_limit(tmp_path):
+    """_make_duckdb_conn without memory_limit sets a limit well below total RAM."""
+
+    conn = _make_duckdb_conn(str(tmp_path))
+    row = conn.execute("SELECT current_setting('memory_limit')").fetchone()
+    assert row is not None, "memory_limit not set"
+    # DuckDB reports the limit as a human-readable string (e.g. '7.5GB').
+    # We just verify it was set (non-empty and not the DuckDB sentinel '-1').
+    limit_str = str(row[0])
+    assert limit_str not in ("", "-1"), f"memory_limit looks unset: {limit_str!r}"
+
+    # Verify explicit override is respected.
+    conn2 = _make_duckdb_conn(str(tmp_path), memory_limit="512MB")
+    row2 = conn2.execute("SELECT current_setting('memory_limit')").fetchone()
+    # DuckDB may report "512MB" as "488.3MiB" or similar; just verify it's non-default.
+    limit_str2 = str(row2[0])
+    assert limit_str2 not in ("", "-1"), f"Explicit limit not applied: {row2[0]!r}"
+
+
+# ---------------------------------------------------------------------------
+# estimate_mean_noise_per_gene: streaming scan correctness
+# ---------------------------------------------------------------------------
+
+
+def _make_sorted_posterior(tmp_dir, rows):
+    """Write rows as a sorted (gene_id, cell_id, c, log_prob) parquet."""
+    parquet_path = tmp_dir / "posterior.parquet"
+    rows_sorted = sorted(rows, key=lambda r: (r[0], r[1], r[2]))  # gene, cell, c
+    gene_ids = np.array([r[0] for r in rows_sorted], dtype=np.int32)
+    cell_ids = np.array([r[1] for r in rows_sorted], dtype=np.int32)
+    c_vals = np.array([r[2] for r in rows_sorted], dtype=np.int32)
+    lp_vals = np.array([r[3] for r in rows_sorted], dtype=np.float32)
+    with pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA) as writer:
+        write_posterior_batch_to_parquet(writer, cell_ids, gene_ids, c_vals, lp_vals)
+    return parquet_path
+
+
+def _reference_mean_noise(rows: list[tuple[int, int, int, float]], n_genes: int) -> np.ndarray:
+    """Brute-force per-gene total mean noise (Python reference, no parquet)."""
+    from collections import defaultdict
+
+    pairs: dict[tuple[int, int], list[tuple[int, float]]] = defaultdict(list)
+    for gene_id, cell_id, c, lp in rows:
+        pairs[(gene_id, cell_id)].append((c, lp))
+    result = np.zeros(n_genes, dtype=np.float64)
+    for (gene_id, cell_id), entries in pairs.items():
+        cs = np.array([e[0] for e in entries], dtype=np.float64)
+        lps = np.array([e[1] for e in entries], dtype=np.float64)
+        max_lp = np.max(lps)
+        shifted = np.exp(lps - max_lp)
+        result[gene_id] += float(np.sum(cs * shifted) / np.sum(shifted))
+    return result
+
+
+@pytest.mark.parametrize("batch_size", [1, 3, 1_000_000], ids=["batch1", "batch3", "batchlarge"])
+def test_estimate_mean_noise_per_gene_streaming(tmp_path_factory, batch_size, monkeypatch):
+    """Streaming scan matches brute-force reference at various batch sizes.
+
+    batch_size=1 forces a new batch boundary after every single row, exercising
+    the cross-batch pending-state logic on every step.
+    batch_size=3 causes boundaries mid-group for some groups.
+    batch_size=large exercises the fully-vectorised path.
+    """
+    import cellbender.remove_background.estimation as est_mod
+
+    monkeypatch.setattr(est_mod, "_STREAM_BATCH_SIZE", batch_size)
+
+    tmp_dir = tmp_path_factory.mktemp("stream_mean")
+
+    # 4 genes, 3 cells; hand-crafted log_prob values (not normalised to 1).
+    # The log-sum-exp trick must handle absolute log_probs as low as -500.
+    rows = [
+        # gene 0, cell 0: two c values
+        (0, 0, 0, -1.0),
+        (0, 0, 1, -0.5),
+        # gene 0, cell 1: single c value → mean = that c
+        (0, 1, 3, -0.1),
+        # gene 0, cell 2: very negative absolute log_prob (tests log-sum-exp)
+        (0, 2, 2, -500.0),
+        (0, 2, 4, -501.0),
+        # gene 1, cell 0: single entry
+        (1, 0, 5, -2.0),
+        # gene 1, cell 1: two entries
+        (1, 1, 1, -3.0),
+        (1, 1, 2, -1.0),
+        # gene 2, cell 2 only
+        (2, 2, 7, -0.3),
+        (2, 2, 8, -0.8),
+        # gene 3: absent from posterior → should be zero
+    ]
+    n_genes = 4
+
+    parquet_path = _make_sorted_posterior(tmp_dir, rows)
+    expected = _reference_mean_noise(rows, n_genes)
+    result = estimate_mean_noise_per_gene(parquet_path, n_genes)
+
+    np.testing.assert_allclose(
+        result,
+        expected,
+        rtol=1e-5,
+        err_msg=f"Streaming result mismatch at batch_size={batch_size}",
+    )
+    assert result[3] == 0.0, "Gene 3 has no posterior entries; result must be 0"

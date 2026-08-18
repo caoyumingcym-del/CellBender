@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import anndata
+import duckdb
 import numpy as np
+import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
 import scipy.sparse as sp
@@ -17,12 +19,6 @@ import scipy.io as io
 import tables
 
 from cellbender.remove_background import consts
-
-from typing import Any, Dict, Union, List, Optional, Callable
-import logging
-import os
-import gzip
-import traceback
 
 
 logger = logging.getLogger('cellbender')
@@ -236,12 +232,34 @@ def write_matrix_to_cellranger_h5(
 # ---------------------------------------------------------------------------
 
 POSTERIOR_SCHEMA = pa.schema([
-    pa.field('cell_id',     pa.int32()),
-    pa.field('gene_id',     pa.int32()),
-    pa.field('c',           pa.int32()),
-    pa.field('log_prob',    pa.float32()),
-    pa.field('regularized', pa.bool_()),
+    pa.field('cell_id',  pa.int32()),
+    pa.field('gene_id',  pa.int32()),
+    pa.field('c',        pa.int32()),
+    pa.field('log_prob', pa.float32()),
 ])
+
+
+def _make_duckdb_conn(
+    tmp_dir: str,
+    memory_limit: Optional[str] = None,
+) -> "duckdb.DuckDBPyConnection":
+    """Create a DuckDB connection configured for safe spill-to-disk behaviour.
+
+    Always sets ``temp_directory`` so spill files land in the output directory
+    rather than ``/tmp`` (which may be RAM-backed inside Docker).  When
+    ``memory_limit`` is not provided, auto-detects 50 % of currently-available
+    system RAM so DuckDB proactively spills before the OS OOM-killer fires.
+    """
+    conn = duckdb.connect()
+    conn.execute(f"SET temp_directory='{tmp_dir}'")
+    if memory_limit is not None:
+        conn.execute(f"SET memory_limit='{memory_limit}'")
+    else:
+        available_bytes = psutil.virtual_memory().available
+        limit_bytes = int(available_bytes * 0.5)
+        conn.execute(f"SET memory_limit='{limit_bytes}B'")
+        logger.debug("DuckDB memory_limit auto-set to %.1f GB", limit_bytes / 2**30)
+    return conn
 
 
 def write_posterior_batch_to_parquet(
@@ -249,33 +267,24 @@ def write_posterior_batch_to_parquet(
         cell_ids: np.ndarray,
         gene_ids: np.ndarray,
         c_vals: np.ndarray,
-        log_probs: np.ndarray,
-        regularized: bool = False) -> None:
+        log_probs: np.ndarray) -> None:
     """Stream one batch of posterior rows into an open ParquetWriter."""
-    n = len(cell_ids)
     batch = pa.table({
-        'cell_id':     pa.array(cell_ids.astype(np.int32),   type=pa.int32()),
-        'gene_id':     pa.array(gene_ids.astype(np.int32),   type=pa.int32()),
-        'c':           pa.array(c_vals.astype(np.int32),     type=pa.int32()),
-        'log_prob':    pa.array(log_probs.astype(np.float32), type=pa.float32()),
-        'regularized': pa.array(np.full(n, regularized, dtype=bool), type=pa.bool_()),
+        'cell_id':  pa.array(cell_ids.astype(np.int32),    type=pa.int32()),
+        'gene_id':  pa.array(gene_ids.astype(np.int32),    type=pa.int32()),
+        'c':        pa.array(c_vals.astype(np.int32),      type=pa.int32()),
+        'log_prob': pa.array(log_probs.astype(np.float32), type=pa.float32()),
     })
     writer.write_table(batch)
 
 
-def sort_posterior_parquet(path: Path, duckdb_memory_limit: "Optional[str]" = None) -> None:
+def sort_posterior_parquet(path: Path, duckdb_memory_limit: Optional[str] = None) -> None:
     """Re-write the posterior parquet sorted by (gene_id, cell_id) for efficient DuckDB scans."""
-    import duckdb
     tmp = Path(str(path) + '.tmp')
     path_str = str(path).replace("'", "''")
     tmp_str  = str(tmp).replace("'", "''")
     tmp_dir  = str(path.parent).replace("'", "''")
-    conn = duckdb.connect()
-    # Always spill to the output directory rather than /tmp, which may be a
-    # RAM-backed tmpfs inside Docker containers.
-    conn.execute(f"SET temp_directory='{tmp_dir}'")
-    if duckdb_memory_limit is not None:
-        conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
+    conn = _make_duckdb_conn(tmp_dir, memory_limit=duckdb_memory_limit)
     conn.execute(
         f"COPY (SELECT * FROM read_parquet('{path_str}') ORDER BY gene_id, cell_id) "
         f"TO '{tmp_str}' (FORMAT PARQUET, COMPRESSION 'snappy')"

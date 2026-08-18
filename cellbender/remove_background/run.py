@@ -293,7 +293,6 @@ def compute_output_denoised_counts_reports_metrics(
             n_cells=len(cell_inds),
             device="cuda" if args.use_cuda else "cpu",  # TODO check this
             per_gene=True,
-            duckdb_memory_limit=args.duckdb_memory_limit,
         )
         logger.info("Target noise counts per gene computed successfully")
 
