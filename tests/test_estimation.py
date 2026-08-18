@@ -10,6 +10,7 @@ import pytest
 import scipy.sparse as sp
 import torch
 
+import cellbender.remove_background.estimation as est_mod
 from cellbender.remove_background.data.io import (
     POSTERIOR_SCHEMA,
     _make_duckdb_conn,
@@ -21,6 +22,7 @@ from cellbender.remove_background.estimation import (
     MultipleChoiceKnapsack,
     SingleSample,
     ThresholdCDF,
+    _mckp_chunk_size,
     estimate_mean_noise_per_gene,
 )
 from cellbender.remove_background.posterior import compute_mean_target_removal_as_function
@@ -457,6 +459,107 @@ def test_mckp_early_exit_when_map_matches_targets(tmp_path_factory):
         .df()
     )
     assert list(df["noise_count"]) == [3, 5], f"Expected [3, 5], got {list(df['noise_count'])}"
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2], ids=["chunk_1", "chunk_2"])
+def test_mckp_chunked_correctness(tmp_path_factory, monkeypatch, chunk_size):
+    """MCKP gives correct, sorted results for different chunk sizes.
+
+    Uses the same 3-cell × 2-gene fixture as test_mckp_multi_cell.
+
+    chunk_size=1: one gene per chunk — exercises the chunked-loop path, including
+      the step-down case (gene 1) and the early-exit case (gene 0, MAP matches
+      target=2 after step-down of one cell).
+    chunk_size=2 (= n_genes): single chunk — exercises the "no real chunking"
+      path that should produce the same result as the original monolithic approach.
+
+    Both cases also verify that the output parquet rows are sorted by
+    (gene_id, cell_id), since the chunked writer concatenates without a final sort.
+    """
+    monkeypatch.setattr(est_mod, "_mckp_chunk_size", lambda source, n_genes: chunk_size)
+
+    tmp_dir = tmp_path_factory.mktemp(f"mckp_chunked_{chunk_size}")
+    parquet_path = tmp_dir / "posterior.parquet"
+    output_path = tmp_dir / "noise.parquet"
+
+    cell_ids, gene_ids, c_vals, log_probs = [], [], [], []
+
+    def _add(cell, gene, c_arr, lp_arr):
+        for c, lp in zip(c_arr, lp_arr):
+            cell_ids.append(cell)
+            gene_ids.append(gene)
+            c_vals.append(c)
+            log_probs.append(lp)
+
+    # gene 0: MAP per cell = [0, 1, 2], target total = 2 → step-down cell 2 by 1
+    _add(0, 0, [0], [0.0])
+    _add(1, 0, [1], [0.0])
+    _add(2, 0, [1, 2, 3], [-2.0, -0.1, -3.0])
+
+    # gene 1: MAP per cell = [3, 3, 3], target total = 7 → step-down 2 of 3 cells
+    for cell in range(3):
+        _add(cell, 1, [2, 3], [-1.0, -0.1])
+
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.array(cell_ids, dtype=np.int32),
+        gene_ids=np.array(gene_ids, dtype=np.int32),
+        c_vals=np.array(c_vals, dtype=np.int32),
+        log_probs=np.array(log_probs, dtype=np.float32),
+    )
+    writer.close()
+
+    targets = np.array([2.0, 7.0])
+    estimator = MultipleChoiceKnapsack(n_cells=3, n_genes=2)
+    estimator.estimate_noise_to_parquet(parquet_path, output_path, noise_targets_per_gene=targets)
+
+    # Correctness: per-gene totals.
+    totals_df = (
+        duckdb.connect()
+        .execute(
+            f"SELECT gene_id, SUM(noise_count) AS total "
+            f"FROM read_parquet('{output_path}') GROUP BY gene_id ORDER BY gene_id"
+        )
+        .df()
+    )
+    totals = {int(row.gene_id): int(row.total) for row in totals_df.itertuples()}
+    assert totals[0] == 2, f"Gene 0 total should be 2, got {totals[0]}"
+    assert totals[1] == 7, f"Gene 1 total should be 7, got {totals[1]}"
+
+    # Sort order: read raw parquet row order (no ORDER BY) and verify.
+    raw = pq.read_table(output_path)
+    gene_arr = raw.column("gene_id").to_pylist()
+    cell_arr = raw.column("cell_id").to_pylist()
+    assert gene_arr == sorted(gene_arr), f"chunk_size={chunk_size}: output not sorted by gene_id: {gene_arr}"
+    for g in sorted(set(gene_arr)):
+        cells_for_gene = [cell_arr[i] for i, gv in enumerate(gene_arr) if gv == g]
+        assert cells_for_gene == sorted(cells_for_gene), (
+            f"chunk_size={chunk_size}: cell_id not sorted within gene {g}: {cells_for_gene}"
+        )
+
+
+def test_mckp_chunk_size_estimation(tmp_path_factory):
+    """_mckp_chunk_size returns a value in [1, n_genes]."""
+    tmp_dir = tmp_path_factory.mktemp("chunk_size")
+    parquet_path = tmp_dir / "posterior.parquet"
+
+    writer = pq.ParquetWriter(str(parquet_path), POSTERIOR_SCHEMA)
+    write_posterior_batch_to_parquet(
+        writer=writer,
+        cell_ids=np.zeros(6, dtype=np.int32),
+        gene_ids=np.array([0, 0, 1, 1, 2, 2], dtype=np.int32),
+        c_vals=np.array([0, 1, 0, 1, 0, 1], dtype=np.int32),
+        log_probs=np.array([-1.0, -2.0, -1.0, -2.0, -1.0, -2.0], dtype=np.float32),
+    )
+    writer.close()
+
+    n_genes = 3
+    cs = _mckp_chunk_size(parquet_path, n_genes)
+    assert 1 <= cs <= n_genes, f"chunk_size={cs} out of [1, {n_genes}]"
+
+    # Edge case: single gene
+    assert _mckp_chunk_size(parquet_path, 1) == 1
 
 
 # ---------------------------------------------------------------------------

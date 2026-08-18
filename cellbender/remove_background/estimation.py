@@ -7,14 +7,14 @@ import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import duckdb
 import numpy as np
 import pandas as pd
+import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
-import scipy.sparse as sp
 
 from cellbender.remove_background.data.io import _make_duckdb_conn
 
@@ -177,21 +177,31 @@ def _register_posterior(
     conn.execute(f"CREATE OR REPLACE VIEW posterior AS SELECT * FROM read_parquet('{source}')")
 
 
-def _ng_arrays_to_csr(
-    cell_ids: np.ndarray,
-    gene_ids: np.ndarray,
-    data: np.ndarray,
-    shape: Tuple[int, int],
-    dtype=COUNT_DATATYPE,
-) -> sp.csr_matrix:
-    """Build a CSR sparse matrix from flat (cell_id, gene_id, data) arrays."""
-    coo = sp.coo_matrix(
-        (data.astype(dtype), (cell_ids.astype(np.int32), gene_ids.astype(np.int32))),
-        shape=shape,
-        dtype=dtype,
-    )
-    coo.sum_duplicates()
-    return coo.tocsr()
+_NOISE_OUTPUT_SCHEMA = pa.schema(
+    [
+        pa.field("cell_id", pa.int32()),
+        pa.field("gene_id", pa.int32()),
+        pa.field("noise_count", pa.int32()),
+    ]
+)
+
+
+def _mckp_chunk_size(source: Path, n_genes: int) -> int:
+    """Return the number of genes per MCKP chunk that fits in available memory.
+
+    Uses parquet metadata (no data scan) to estimate average rows per gene, then
+    sizes the chunk so that the raw posterior data plus DuckDB working space stay
+    within 40 % of currently available RAM.
+    """
+    if n_genes <= 1:
+        return n_genes
+    meta = pq.read_metadata(str(source))
+    avg_rows_per_gene = max(meta.num_rows / n_genes, 1.0)
+    budget_bytes = psutil.virtual_memory().available * 0.40
+    # 16 bytes/row raw (4 × int32/float32); ~4× working-space multiplier for
+    # DuckDB GROUP BY hash tables, sort buffers, and join working sets.
+    chunk_size = int(budget_bytes / (avg_rows_per_gene * 16 * 4))
+    return max(1, min(chunk_size, n_genes))
 
 
 def _estimate_via_sql_to_parquet(
@@ -424,8 +434,11 @@ def estimate_mean_noise_per_gene(
 class MultipleChoiceKnapsack(EstimationMethod):
     """Noise estimation via the multiple-choice knapsack problem, solved with DuckDB SQL.
 
-    DuckDB executes out-of-core by default so this scales to datasets with
-    millions of non-zero posterior entries without incurring OOM errors.
+    Genes are processed in memory-bounded chunks (auto-sized from available RAM).
+    Each chunk reads a disjoint slice of the posterior parquet, runs MAP + knapsack
+    adjustment steps entirely in DuckDB, and writes its output to the output parquet
+    via a PyArrow ParquetWriter.  Peak memory is O(chunk_rows) rather than
+    O(total_posterior_rows).
     """
 
     def estimate_noise_to_parquet(
@@ -433,22 +446,15 @@ class MultipleChoiceKnapsack(EstimationMethod):
         noise_log_prob_coo: Path,
         output_path: Path,
         noise_targets_per_gene: Optional[np.ndarray] = None,
-        duckdb_memory_limit: Optional[str] = None,
         verbose: bool = False,
         **kwargs,
     ) -> None:
-        """Estimate MCKP noise counts and write to parquet without building full CSR matrices.
-
-        Computes MAP counts and knapsack adjustment steps in DuckDB, then uses
-        a final DuckDB ``COPY TO`` to write ``(cell_id, gene_id, noise_count)``
-        sorted by ``(gene_id, cell_id)``.  No full-matrix Python objects are
-        created.
+        """Estimate MCKP noise counts and write to parquet, one gene-chunk at a time.
 
         Args:
-            noise_log_prob_coo: Path to posterior parquet.
-            output_path: Destination parquet file.
+            noise_log_prob_coo: Path to posterior parquet (sorted by gene_id, cell_id).
+            output_path: Destination parquet with (cell_id, gene_id, noise_count).
             noise_targets_per_gene: Per-gene noise count targets (required).
-            duckdb_memory_limit: DuckDB memory cap.
             verbose: Log intermediate DuckDB results.
         """
         assert noise_targets_per_gene is not None, (
@@ -456,135 +462,170 @@ class MultipleChoiceKnapsack(EstimationMethod):
         )
 
         t0 = time.time()
+        chunk_size = _mckp_chunk_size(noise_log_prob_coo, self.n_genes)
+        n_chunks = (self.n_genes + chunk_size - 1) // chunk_size
+        logger.debug(
+            "MCKP: %d genes, chunk_size=%d, %d chunk(s)",
+            self.n_genes,
+            chunk_size,
+            n_chunks,
+        )
 
         tmp_dir = str(noise_log_prob_coo.parent).replace("'", "''")
-        conn = _make_duckdb_conn(tmp_dir, memory_limit=duckdb_memory_limit)
+        conn = _make_duckdb_conn(tmp_dir)
         _register_posterior(conn, noise_log_prob_coo)
 
-        # Step 1: MAP estimate
-        map_df = conn.execute("""
-            SELECT
-                cell_id,
-                gene_id,
-                CAST(argmax(c, log_prob) AS INTEGER) AS map_c
-            FROM posterior
-            GROUP BY cell_id, gene_id
+        # ── Global MAP sums (single DuckDB pass, O(n_genes) result) ──────────
+        # argmax uses a plain GROUP BY — no window self-join — so this is a
+        # single-scan aggregation that DuckDB can spill to disk if needed.
+        map_noise_df = conn.execute("""
+            WITH map_cg AS (
+                SELECT gene_id,
+                       CAST(argmax(c, log_prob) AS INTEGER) AS map_c
+                FROM posterior
+                GROUP BY cell_id, gene_id
+            )
+            SELECT gene_id, SUM(map_c) AS map_noise
+            FROM map_cg
+            GROUP BY gene_id
+            ORDER BY gene_id
         """).df()
 
-        if verbose:
-            logger.debug("MAP head:\n%s", map_df.head(10).to_string())
+        map_noise_per_gene = np.zeros(self.n_genes, dtype=np.float64)
+        if len(map_noise_df) > 0:
+            map_noise_per_gene[map_noise_df["gene_id"].to_numpy()] = map_noise_df["map_noise"].to_numpy()
 
-        # Compute per-gene adjustment needed
-        map_csr = _ng_arrays_to_csr(
-            cell_ids=map_df["cell_id"].values,
-            gene_ids=map_df["gene_id"].values,
-            data=map_df["map_c"].values.astype(COUNT_DATATYPE),
-            shape=(self.n_cells, self.n_genes),
-        )
-        map_noise_per_gene = np.asarray(map_csr.sum(axis=0)).squeeze()
-        del map_csr
         additional = (noise_targets_per_gene - map_noise_per_gene).astype(int)
         step_dir = np.sign(additional).astype(np.int32)
         topk = np.abs(additional).astype(np.int64)
 
-        gene_targets_df = pd.DataFrame(
-            {
-                "gene_id": np.arange(self.n_genes, dtype=np.int32),
-                "step_direction": step_dir,
-                "topk": topk,
-            }
-        )
-        gene_targets_df = gene_targets_df[gene_targets_df["step_direction"] != 0].reset_index(drop=True)
+        # ── Chunked loop: MAP per chunk → steps → combine → write ────────────
+        writer = pq.ParquetWriter(str(output_path), _NOISE_OUTPUT_SCHEMA)
+        try:
+            for start in range(0, self.n_genes, chunk_size):
+                end = min(start + chunk_size, self.n_genes)
 
-        out_str = str(output_path).replace("'", "''")
+                chunk_map_df = conn.execute(f"""
+                    SELECT
+                        cell_id,
+                        gene_id,
+                        CAST(argmax(c, log_prob) AS INTEGER) AS map_c
+                    FROM posterior
+                    WHERE gene_id >= {start} AND gene_id < {end}
+                    GROUP BY cell_id, gene_id
+                    ORDER BY gene_id, cell_id
+                """).df()
 
-        if len(gene_targets_df) == 0:
-            # MAP already matches targets — write map_df directly to parquet.
-            logger.info("MCKP: MAP already matches targets for all genes.")
-            conn.register("map_estimates_final", map_df[["cell_id", "gene_id", "map_c"]])
-            conn.execute(
-                f"COPY (SELECT cell_id, gene_id, map_c AS noise_count "
-                f"FROM map_estimates_final ORDER BY gene_id, cell_id) "
-                f"TO '{out_str}' (FORMAT PARQUET, COMPRESSION 'snappy')"
-            )
-            logger.info("Total MCKP estimation time = %.2f sec", time.time() - t0)
-            return
+                if len(chunk_map_df) == 0:
+                    continue
 
-        conn.register("gene_targets", gene_targets_df)
-        conn.register("map_estimates", map_df[["cell_id", "gene_id", "map_c"]])
+                chunk_step_dir = step_dir[start:end]
+                chunk_topk = topk[start:end]
+                needs_adjust = chunk_step_dir != 0
 
-        # Step 2: Compute adjustment steps
-        steps_df = conn.execute("""
-            WITH directed AS (
-                SELECT
-                    p.cell_id,
-                    p.gene_id,
-                    p.c,
-                    p.log_prob,
-                    t.step_direction,
-                    t.topk,
-                    m.map_c,
-                    LAG(p.log_prob)  OVER w AS lag_lp,
-                    LEAD(p.log_prob) OVER w AS lead_lp
-                FROM posterior p
-                JOIN gene_targets  t ON p.gene_id = t.gene_id
-                JOIN map_estimates m ON p.cell_id  = m.cell_id
-                                    AND p.gene_id  = m.gene_id
-                WHERE (
-                        (t.step_direction =  1 AND p.c >= m.map_c)
-                     OR (t.step_direction = -1 AND p.c <= m.map_c)
-                  )
-                WINDOW w AS (PARTITION BY p.cell_id, p.gene_id ORDER BY p.c)
-            ),
-            deltas AS (
-                SELECT
-                    cell_id,
-                    gene_id,
-                    step_direction,
-                    topk,
-                    ABS(
-                        CASE WHEN step_direction =  1 THEN log_prob - lag_lp
-                             ELSE                          log_prob - lead_lp
-                        END
-                    ) AS delta
-                FROM directed
-                WHERE (step_direction =  1 AND lag_lp  IS NOT NULL)
-                   OR (step_direction = -1 AND lead_lp IS NOT NULL)
-            ),
-            ranked AS (
-                SELECT
-                    cell_id,
-                    gene_id,
-                    step_direction,
-                    topk,
-                    ROW_NUMBER() OVER (PARTITION BY gene_id ORDER BY delta) AS rn
-                FROM deltas
-            )
-            SELECT
-                cell_id,
-                gene_id,
-                CAST(COUNT(*) AS INTEGER) * any_value(step_direction) AS step_counts
-            FROM ranked
-            WHERE rn <= topk
-            GROUP BY cell_id, gene_id
-        """).df()
+                chunk_gene_targets_df = pd.DataFrame(
+                    {
+                        "gene_id": np.arange(start, end, dtype=np.int32)[needs_adjust],
+                        "step_direction": chunk_step_dir[needs_adjust],
+                        "topk": chunk_topk[needs_adjust],
+                    }
+                )
 
-        if verbose:
-            logger.debug("Steps head:\n%s", steps_df.head(10).to_string())
+                if len(chunk_gene_targets_df) == 0:
+                    # MAP already matches targets for every gene in this chunk.
+                    out_df = chunk_map_df[["cell_id", "gene_id"]].copy()
+                    out_df["noise_count"] = chunk_map_df["map_c"].astype(np.int32)
+                    writer.write_table(pa.Table.from_pandas(out_df, schema=_NOISE_OUTPUT_SCHEMA, preserve_index=False))
+                    continue
+
+                conn.register("chunk_map", chunk_map_df)
+                conn.register("chunk_targets", chunk_gene_targets_df)
+
+                chunk_steps_df = conn.execute(f"""
+                    WITH directed AS (
+                        SELECT
+                            p.cell_id,
+                            p.gene_id,
+                            p.c,
+                            p.log_prob,
+                            t.step_direction,
+                            t.topk,
+                            m.map_c,
+                            LAG(p.log_prob)  OVER w AS lag_lp,
+                            LEAD(p.log_prob) OVER w AS lead_lp
+                        FROM posterior p
+                        JOIN chunk_targets t ON p.gene_id = t.gene_id
+                        JOIN chunk_map     m ON p.cell_id = m.cell_id
+                                            AND p.gene_id = m.gene_id
+                        WHERE p.gene_id >= {start} AND p.gene_id < {end}
+                          AND (
+                                (t.step_direction =  1 AND p.c >= m.map_c)
+                             OR (t.step_direction = -1 AND p.c <= m.map_c)
+                              )
+                        WINDOW w AS (PARTITION BY p.cell_id, p.gene_id ORDER BY p.c)
+                    ),
+                    deltas AS (
+                        SELECT
+                            cell_id,
+                            gene_id,
+                            step_direction,
+                            topk,
+                            ABS(
+                                CASE WHEN step_direction =  1 THEN log_prob - lag_lp
+                                     ELSE                          log_prob - lead_lp
+                                END
+                            ) AS delta
+                        FROM directed
+                        WHERE (step_direction =  1 AND lag_lp  IS NOT NULL)
+                           OR (step_direction = -1 AND lead_lp IS NOT NULL)
+                    ),
+                    ranked AS (
+                        SELECT
+                            cell_id,
+                            gene_id,
+                            step_direction,
+                            topk,
+                            ROW_NUMBER() OVER (PARTITION BY gene_id ORDER BY delta) AS rn
+                        FROM deltas
+                    )
+                    SELECT
+                        cell_id,
+                        gene_id,
+                        CAST(COUNT(*) AS INTEGER) * any_value(step_direction) AS step_counts
+                    FROM ranked
+                    WHERE rn <= topk
+                    GROUP BY cell_id, gene_id
+                """).df()
+
+                if verbose:
+                    logger.debug(
+                        "Chunk [%d, %d) steps head:\n%s",
+                        start,
+                        end,
+                        chunk_steps_df.head(5).to_string(),
+                    )
+
+                if len(chunk_steps_df) > 0:
+                    merged = chunk_map_df.merge(
+                        chunk_steps_df[["cell_id", "gene_id", "step_counts"]],
+                        on=["cell_id", "gene_id"],
+                        how="left",
+                    )
+                    merged["noise_count"] = (merged["map_c"] + merged["step_counts"].fillna(0)).astype(np.int32)
+                else:
+                    merged = chunk_map_df.copy()
+                    merged["noise_count"] = merged["map_c"].astype(np.int32)
+
+                out_df = (
+                    merged[["cell_id", "gene_id", "noise_count"]]
+                    .sort_values(["gene_id", "cell_id"])
+                    .reset_index(drop=True)
+                )
+                writer.write_table(pa.Table.from_pandas(out_df, schema=_NOISE_OUTPUT_SCHEMA, preserve_index=False))
+        finally:
+            writer.close()
 
         logger.info("Total MCKP estimation time = %.2f sec", time.time() - t0)
-
-        # Step 3: Join MAP and adjustments; write final (cell_id, gene_id, noise_count) to parquet.
-        conn.register("steps_final", steps_df[["cell_id", "gene_id", "step_counts"]])
-        conn.execute(
-            f"COPY ("
-            f"SELECT m.cell_id, m.gene_id, "
-            f"       m.map_c + COALESCE(s.step_counts, 0) AS noise_count "
-            f"FROM map_estimates m "
-            f"LEFT JOIN steps_final s ON m.cell_id = s.cell_id AND m.gene_id = s.gene_id "
-            f"ORDER BY m.gene_id, m.cell_id"
-            f") TO '{out_str}' (FORMAT PARQUET, COMPRESSION 'snappy')"
-        )
 
 
 def timestamp() -> str:
