@@ -278,7 +278,7 @@ def compute_output_denoised_counts_reports_metrics(
         estimator = MultipleChoiceKnapsack
 
         # Prep specific for MCKP: target estimation.
-        logger.info("Computing target noise counts per gene for MCKP estimator")
+        logger.info("Computing target noise counts per gene for MCKP estimator (two-pass GROUP BY)")
         count_matrix = posterior.dataset_obj.data["matrix"]  # all barcodes
         cell_inds = posterior.dataset_obj.analyzed_barcode_inds[posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF]
         empty_inds = set(range(count_matrix.shape[0])) - set(cell_inds)
@@ -295,6 +295,7 @@ def compute_output_denoised_counts_reports_metrics(
             per_gene=True,
             duckdb_memory_limit=args.duckdb_memory_limit,
         )
+        logger.info("Target noise counts per gene computed successfully")
 
         def noise_target_fun(x):
             return noise_target_fun_per_cell(x) * len(cell_inds)

@@ -228,8 +228,11 @@ def estimate_mean_noise_per_gene(
 ) -> np.ndarray:
     """Return total E[noise_count] per gene, summed over all cells.
 
-    A single aggregated DuckDB query returns only *n_analyzed_genes* rows
-    (~5k-10k), entirely avoiding the large per-(cell, gene) DataFrame.
+    Two-level GROUP BY: first computes per-(cell, gene) mean noise via the
+    log-sum-exp trick (reading the parquet twice — once for the per-pair max,
+    once for the weighted sum), then aggregates those means by gene.  No window
+    functions are used, so every intermediate step can spill to disk with
+    predictable, bounded peak RAM.
 
     Args:
         source: Path to posterior parquet.
@@ -241,28 +244,31 @@ def estimate_mean_noise_per_gene(
         mean_noise_per_gene: 1-D array of shape ``(n_genes,)`` where
             entry *g* is ``sum_over_cells(E[noise_count(cell, g)])``.
     """
+    # Two-pass query: the first scan computes max(log_prob) per (cell, gene),
+    # which is joined back to the second scan to shift log-probs before exp().
+    # This avoids window functions — all intermediate aggregations can spill to
+    # disk, keeping peak RAM proportional to the number of unique (cell, gene)
+    # pairs rather than the total number of posterior rows.
     query = """
-        WITH shifted AS (
-            SELECT
-                cell_id,
-                gene_id,
-                c,
-                EXP(log_prob - MAX(log_prob) OVER (PARTITION BY cell_id, gene_id)) AS prob_raw
+        WITH max_per_pair AS (
+            SELECT cell_id, gene_id, MAX(log_prob) AS max_log_prob
             FROM posterior
             WHERE NOT regularized
+            GROUP BY cell_id, gene_id
         ),
-        normalized AS (
+        mean_per_pair AS (
             SELECT
-                cell_id,
-                gene_id,
-                c,
-                prob_raw / SUM(prob_raw) OVER (PARTITION BY cell_id, gene_id) AS prob
-            FROM shifted
+                p.gene_id,
+                SUM(CAST(p.c AS DOUBLE) * EXP(p.log_prob - m.max_log_prob))
+                    / SUM(EXP(p.log_prob - m.max_log_prob)) AS mean_noise_cg
+            FROM posterior p
+            JOIN max_per_pair m
+              ON p.cell_id = m.cell_id AND p.gene_id = m.gene_id
+            WHERE NOT p.regularized
+            GROUP BY p.cell_id, p.gene_id
         )
-        SELECT
-            gene_id,
-            SUM(CAST(c AS DOUBLE) * prob) AS total_mean_noise
-        FROM normalized
+        SELECT gene_id, SUM(mean_noise_cg) AS total_mean_noise
+        FROM mean_per_pair
         GROUP BY gene_id
     """
     conn = duckdb.connect()
