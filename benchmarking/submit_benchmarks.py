@@ -122,6 +122,7 @@ def build_job_script(
         "    --input /tmp/input.h5",
         f"    --output /tmp/{sample}_out.h5",
         "    --cuda",
+        "    --debug",
         "    --checkpoint-mins 200",
         "    --exclude-feature-types Peaks",
     ]

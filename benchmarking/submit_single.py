@@ -35,18 +35,25 @@ def build_dev_job_script(
     sample: str,
     output_gcs_dir: str,
     extra_args: str,
+    checkpoint_gcs: str = "",
 ) -> str:
     lines = _build_preamble_lines(git_hash, input_gcs)
+    if checkpoint_gcs:
+        lines.append(f"gsutil cp {checkpoint_gcs} /tmp/checkpoint.tar.gz")
     cmd_parts = [
         "cellbender remove-background",
         "    --input /tmp/input.h5",
         f"    --output /tmp/{sample}_out.h5",
         "    --cuda",
     ]
+    if checkpoint_gcs:
+        cmd_parts.append("    --checkpoint /tmp/checkpoint.tar.gz")
+        cmd_parts.append("    --force-use-checkpoint")
     if extra_args.strip():
         cmd_parts.append(f"    {extra_args.strip()}")
     lines.append(" \\\n".join(cmd_parts))
     lines.append(f"gsutil -m cp /tmp/{sample}_out* {output_gcs_dir}/")
+    lines.append(f"gsutil -m cp /tmp/*.tar.gz {output_gcs_dir}/")
     return "\n".join(lines)
 
 
@@ -63,6 +70,11 @@ def main() -> None:
         "--extra-args",
         default="",
         help="Extra args appended verbatim to the cellbender command",
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        default="",
+        help="GCS path to a checkpoint tarball to resume from (optional)",
     )
     parser.add_argument(
         "--output-bucket",
@@ -114,6 +126,7 @@ def main() -> None:
         sample=sample,
         output_gcs_dir=output_gcs_dir,
         extra_args=args.extra_args,
+        checkpoint_gcs=args.checkpoint_file,
     )
 
     hw_desc = f"machine={machine_type or 'auto'}, gpu={args.gpu_type}, cpu={cpu_count}, memory={memory_gb}GB"
