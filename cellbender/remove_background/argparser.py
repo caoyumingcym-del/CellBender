@@ -364,6 +364,12 @@ def add_subparser_args(subparsers: argparse._SubParsersAction) -> argparse._SubP
         "Useful on shared cluster nodes where you want to cap CellBender's memory footprint.",
     )
     subparser.add_argument(
+        "--no-report",
+        dest="no_report",
+        action="store_true",
+        help="Skip HTML report generation after training completes.",
+    )
+    subparser.add_argument(
         "--debug",
         dest="debug",
         action="store_true",

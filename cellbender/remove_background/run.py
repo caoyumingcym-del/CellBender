@@ -194,7 +194,8 @@ def run_remove_background(args: argparse.Namespace) -> None:
         torch.cuda.empty_cache()
 
         # Generate HTML reports (reads only already-written output files).
-        _generate_output_reports(args=args, file_dir=file_dir, file_name=file_name)
+        if not args.no_report:
+            _generate_output_reports(args=args, file_dir=file_dir, file_name=file_name)
 
         logger.info("Completed remove-background.")
         logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
