@@ -1,6 +1,7 @@
 """Full run through on small simulated data"""
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -9,6 +10,7 @@ from conftest import USE_CUDA
 from cellbender.base_cli import get_populated_argparser
 from cellbender.remove_background import consts
 from cellbender.remove_background.cli import CLI
+from cellbender.remove_background.data.io import load_posterior_latents_csv
 from cellbender.remove_background.downstream import anndata_from_h5
 
 
@@ -42,15 +44,16 @@ def test_full_run(tmpdir_factory, h5_v3_file, cuda):
     args = CLI.validate_args(args=args)
 
     # do a full run through
-    posterior = CLI.run(args=args)
+    CLI.run(args=args)
 
     # do some checks
 
-    # ensure the cell probabilities in the posterior object match the output file
-    p_for_analyzed_barcodes = posterior.latents_map["p"]
+    # ensure the cell probabilities in the latents sidecar match the output file
+    latents_csv = Path(str(filename)[:-3] + "_posterior_latents.csv.gz")
+    p_for_analyzed_barcodes = load_posterior_latents_csv(latents_csv)["p"]
     adata = anndata_from_h5(str(filename), analyzed_barcodes_only=True)
     file_p_for_analyzed_barcodes = adata.obs["cell_probability"].values
-    np.testing.assert_array_equal(p_for_analyzed_barcodes, file_p_for_analyzed_barcodes)
+    np.testing.assert_allclose(p_for_analyzed_barcodes, file_p_for_analyzed_barcodes, rtol=1e-5)
 
     # ensure the cell barcodes are the same both ways
     cell_barcodes = np.genfromtxt(str(filename)[:-3] + "_cell_barcodes.csv", dtype=str, delimiter="\n")

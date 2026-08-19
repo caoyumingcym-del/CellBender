@@ -8,7 +8,6 @@ import sys
 import torch
 
 from cellbender.base_cli import AbstractCLI, get_version
-from cellbender.remove_background.posterior import Posterior
 from cellbender.remove_background.run import run_remove_background
 
 
@@ -192,7 +191,7 @@ class CLI(AbstractCLI):
         return args
 
     @staticmethod
-    def run(args) -> Posterior:
+    def run(args) -> None:
         """Run the main tool functionality on parsed arguments."""
 
         # Run the tool.
@@ -223,13 +222,13 @@ def setup_and_logging(args):
     return args, file_handler
 
 
-def main(args) -> Posterior:
+def main(args) -> None:
     """Take command-line input, parse arguments, and run tests or tool."""
 
     args, file_handler = setup_and_logging(args)
 
     # Run the tool.
-    posterior = run_remove_background(args)
+    run_remove_background(args)
     file_handler.close()
 
-    return posterior
+    return None

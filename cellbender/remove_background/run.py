@@ -52,7 +52,7 @@ matplotlib.use("Agg")
 logger = logging.getLogger("cellbender")
 
 
-def run_remove_background(args: argparse.Namespace) -> Posterior:
+def run_remove_background(args: argparse.Namespace) -> None:
     """The full script for the command line tool to remove background RNA.
 
     Args:
@@ -179,17 +179,27 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
         write_cell_barcodes_csv(bc_file_name=bc_file_name, cell_barcodes=cell_barcodes)
 
         # Compute estimates of denoised count matrix for each FPR and save them.
-        compute_output_denoised_counts_reports_metrics(
+        compute_output_denoised_counts_and_metrics(
             posterior=posterior,
             args=args,
             file_dir=file_dir,
             file_name=file_name,
         )
 
+        # Free large in-memory objects before generating reports.
+        logger.info("Freeing large in-memory objects before generating reports...")
+        del dataset_obj
+        del posterior
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Generate HTML reports (reads only already-written output files).
+        _generate_output_reports(args=args, file_dir=file_dir, file_name=file_name)
+
         logger.info("Completed remove-background.")
         logger.info(datetime.now().strftime("%Y-%m-%d %H:%M:%S\n"))
 
-        return posterior
+        return None
 
     # The exception allows user to end inference prematurely with CTRL-C.
     except KeyboardInterrupt:
@@ -238,34 +248,68 @@ def save_output_plots(
         return False
 
 
-def compute_output_denoised_counts_reports_metrics(
-    posterior: Posterior, args: argparse.Namespace, file_dir: str, file_name: str
+def compute_output_denoised_counts_and_metrics(
+    posterior: "Posterior",
+    args: argparse.Namespace,
+    file_dir: str,
+    file_name: str,
 ) -> bool:
-    """Handle the estimation of the output denoised count matrix, given a
-    posterior.  Compute the estimate for all specified FPR values.  Save each
-    as we go.  Create reports and save, and aggregate metrics and save as we go.
+    """Write H5 outputs and metrics CSVs for every FPR. Does NOT generate reports.
+
+    Extracts Pyro params once at entry and immediately clears the param store,
+    freeing GPU tensors before any disk I/O begins.  For MCKP, frees the
+    cell-count sparse matrix as soon as the noise-target closure is built.
 
     Args:
-        posterior: Posterior object
-        args: Argparser namespace with all parsed input args
-        file_dir:
-        file_name:
+        posterior: Posterior object with computed posterior parquet.
+        args: Parsed command-line arguments.
+        file_dir: Directory for output files.
+        file_name: Base filename (no extension).
 
     Returns:
-        True iff all files write correctly
-
+        True iff all H5 and metric files were written successfully.
     """
-
-    # Ensure that the posterior distribution has been computed.
-    posterior.ensure_posterior_computed()
-
-    assert posterior.dataset_obj is not None and posterior.dataset_obj.data is not None
-
-    # Choose output count matrix estimation method.
     from cellbender.remove_background.estimation import EstimationMethod
 
+    posterior.ensure_posterior_computed()
+    assert posterior.dataset_obj is not None and posterior.dataset_obj.data is not None
+    dataset_obj = posterior.dataset_obj
+
+    # --- Extract Pyro params once, then clear the store ---
+    ambient_expression_trimmed = pyro.param("chi_ambient").detach().cpu().numpy()
+    assert dataset_obj.data is not None  # mypy
+    total_genes_all = dataset_obj.data["matrix"].shape[1]
+    ambient_expression = np.zeros(total_genes_all)
+    ambient_expression[dataset_obj.analyzed_gene_inds] = ambient_expression_trimmed
+    del ambient_expression_trimmed
+
+    rho = None
+    if ("rho_alpha" in pyro.get_param_store().keys()) and ("rho_beta" in pyro.get_param_store().keys()):
+        rho = np.array(
+            [
+                pyro.param("rho_alpha").detach().cpu().numpy().item(),
+                pyro.param("rho_beta").detach().cpu().numpy().item(),
+            ]
+        )
+
+    global_latents: Dict[str, Any] = {
+        "ambient_expression": ambient_expression,
+        "empty_droplet_size_lognormal_loc": np.array(pyro.param("d_empty_loc").item()),
+        "empty_droplet_size_lognormal_scale": np.array(pyro.param("d_empty_scale").item()),
+        "cell_size_lognormal_std": np.array(pyro.param("d_cell_scale").item()),
+        "swapping_fraction_dist_params": rho,
+    }
+    pyro.clear_param_store()
+    logger.debug("Pyro param store cleared after extracting global latents.")
+
+    # --- Choose estimator ---
     estimator: type[EstimationMethod]
     noise_target_fun = None
+    noise_target_fun_per_cell = None
+
+    analyzed_barcode_logic = posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF
+    cell_inds = dataset_obj.analyzed_barcode_inds[analyzed_barcode_logic]
+
     if args.estimator == "map":
         estimator = MAP
     elif args.estimator == "mean":
@@ -277,10 +321,8 @@ def compute_output_denoised_counts_reports_metrics(
     elif args.estimator == "mckp":
         estimator = MultipleChoiceKnapsack
 
-        # Prep specific for MCKP: target estimation.
         logger.info("Computing target noise counts per gene for MCKP estimator (two-pass GROUP BY)")
-        count_matrix = posterior.dataset_obj.data["matrix"]  # all barcodes
-        cell_inds = posterior.dataset_obj.analyzed_barcode_inds[posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF]
+        count_matrix = dataset_obj.data["matrix"]
         empty_inds = set(range(count_matrix.shape[0])) - set(cell_inds)
         cell_counts = csr_set_rows_to_zero(csr=count_matrix, row_inds=empty_inds)
 
@@ -291,22 +333,23 @@ def compute_output_denoised_counts_reports_metrics(
             n_genes=posterior.n_genes,
             raw_count_csr_for_cells=cell_counts,
             n_cells=len(cell_inds),
-            device="cuda" if args.use_cuda else "cpu",  # TODO check this
+            device="cuda" if args.use_cuda else "cpu",
             per_gene=True,
         )
+        del cell_counts  # closure does not capture it
         logger.info("Target noise counts per gene computed successfully")
 
         def noise_target_fun(x):
             return noise_target_fun_per_cell(x) * len(cell_inds)
+
     else:
         raise ValueError('Input --estimator must be one of ["map", "mean", "sample", "cdf", "mckp"]')
 
-    # Save denoised count matrix outputs (for each FPR if applicable).
+    # --- FPR loop: write H5s and metrics ---
     success = True
     for fpr in args.fpr:
         logger.debug(f"Working on FPR {fpr}")
 
-        # If using MCKP, recompute noise targets for this FPR.
         if noise_target_fun is not None:
             noise_targets = noise_target_fun(fpr).detach().cpu().numpy()
             logger.debug(f"Computed noise targets for FPR {fpr}:\n{noise_targets}")
@@ -314,7 +357,6 @@ def compute_output_denoised_counts_reports_metrics(
         else:
             noise_targets = None
 
-        # Save denoised count matrix.
         name_suffix = f"_FPR_{fpr}" if len(args.fpr) > 1 else ""
         fpr_output_filename = os.path.join(file_dir, file_name + name_suffix + ".h5")
         filtered_output_file = os.path.join(file_dir, file_name + name_suffix + "_filtered.h5")
@@ -322,7 +364,7 @@ def compute_output_denoised_counts_reports_metrics(
         total_denoised_counts: Optional[float] = None
 
         logger.info(f"Computing denoised counts using {args.estimator} estimator (streaming)")
-        assert posterior.n_cells is not None and posterior.n_genes is not None  # mypy
+        assert posterior.n_cells is not None and posterior.n_genes is not None
         estimator_obj = estimator(n_cells=posterior.n_cells, n_genes=posterior.n_genes)
         full_ok, filt_ok, total_denoised_counts = _write_streaming_denoised_outputs(
             posterior=posterior,
@@ -332,13 +374,13 @@ def compute_output_denoised_counts_reports_metrics(
             fpr=fpr,
             fpr_output_filename=fpr_output_filename,
             filtered_output_file=filtered_output_file,
+            global_latents=global_latents,
         )
         success = success and full_ok and filt_ok
 
-        # Compile and save metrics.
         try:
             df = collect_output_metrics(
-                dataset_obj=posterior.dataset_obj,
+                dataset_obj=dataset_obj,
                 fpr=fpr,
                 cell_logic=(posterior.latents_map["p"] >= consts.CELL_PROB_CUTOFF),
                 loss=posterior.model_loss,
@@ -351,24 +393,44 @@ def compute_output_denoised_counts_reports_metrics(
             logger.warning("Unable to collect output metrics.")
             logger.warning(traceback.format_exc())
 
-        # Create report.
+    if noise_target_fun is not None:
+        del noise_target_fun, noise_target_fun_per_cell
+
+    return success
+
+
+def _generate_output_reports(
+    args: argparse.Namespace,
+    file_dir: str,
+    file_name: str,
+) -> None:
+    """Generate HTML reports for every FPR by executing the report notebook.
+
+    Reads only already-written output files — no large in-memory objects needed.
+
+    Args:
+        args: Parsed command-line arguments (needs ``fpr``, ``input_file``,
+            ``output_file``, ``truth_file``).
+        file_dir: Directory containing output files.
+        file_name: Base filename (no extension).
+    """
+    for fpr in args.fpr:
+        name_suffix = f"_FPR_{fpr}" if len(args.fpr) > 1 else ""
+        fpr_output_filename = os.path.join(file_dir, file_name + name_suffix + ".h5")
+        html_report_file = os.path.join(file_dir, file_name + name_suffix + "_report.html")
         try:
             os.environ["INPUT_FILE"] = os.path.abspath(os.path.join(os.getcwd(), args.input_file))
             os.environ["OUTPUT_FILE"] = os.path.abspath(os.path.join(os.getcwd(), fpr_output_filename))
             if args.truth_file is not None:
                 os.environ["TRUTH_FILE"] = os.path.abspath(os.path.join(os.getcwd(), args.truth_file))
-            html_report_file = os.path.join(file_dir, file_name + name_suffix + "_report.html")
             run_notebook_make_html(
                 file=os.path.abspath(os.path.join(os.path.dirname(__file__), "report.ipynb")),
                 output=html_report_file,
             )
             logger.info(f"Succeeded in writing report to {html_report_file}")
-
         except Exception:
             logger.warning("Unable to create report.")
             logger.warning(traceback.format_exc())
-
-    return success
 
 
 def _write_streaming_denoised_outputs(
@@ -379,6 +441,7 @@ def _write_streaming_denoised_outputs(
     fpr: float,
     fpr_output_filename: str,
     filtered_output_file: str,
+    global_latents: Dict[str, Any],
 ) -> Tuple[bool, bool, float]:
     """Write full and filtered denoised H5 files via barcode-streaming.
 
@@ -414,30 +477,10 @@ def _write_streaming_denoised_outputs(
     analyzed_barcode_logic = posterior.latents_map["p"] > consts.CELL_PROB_CUTOFF
     cell_inds = analyzed_barcode_inds[analyzed_barcode_logic]
 
-    # Step 2: Build latents, metadata, and global latents.
+    # Step 2: Build latents and metadata.
     latents = posterior.latents_map
 
-    ambient_expression_trimmed = pyro.param("chi_ambient").detach().cpu().numpy()
     assert dataset_obj.data is not None  # mypy
-    ambient_expression = np.zeros(dataset_obj.data["matrix"].shape[1])
-    ambient_expression[dataset_obj.analyzed_gene_inds] = ambient_expression_trimmed
-
-    rho = None
-    if ("rho_alpha" in pyro.get_param_store().keys()) and ("rho_beta" in pyro.get_param_store().keys()):
-        rho = np.array(
-            [
-                pyro.param("rho_alpha").detach().cpu().numpy().item(),
-                pyro.param("rho_beta").detach().cpu().numpy().item(),
-            ]
-        )
-
-    global_latents: Dict[str, Any] = {
-        "ambient_expression": ambient_expression,
-        "empty_droplet_size_lognormal_loc": np.array(pyro.param("d_empty_loc").item()),
-        "empty_droplet_size_lognormal_scale": np.array(pyro.param("d_empty_scale").item()),
-        "cell_size_lognormal_std": np.array(pyro.param("d_cell_scale").item()),
-        "swapping_fraction_dist_params": rho,
-    }
 
     metadata: Dict[str, Any] = {
         "learning_curve": posterior.model_loss,
@@ -480,7 +523,6 @@ def _write_streaming_denoised_outputs(
     shared_kwargs: Dict[str, Any] = dict(
         noise_parquet_path=noise_parquet,
         raw_count_matrix=raw_matrix,
-        analyzed_gene_inds=dataset_obj.analyzed_gene_inds,
         cell_logic=analyzed_barcode_logic,
         analyzed_barcode_inds=analyzed_barcode_inds,
         gene_names=dataset_obj.data["gene_names"],

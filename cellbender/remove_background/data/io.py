@@ -389,6 +389,21 @@ class IncrementalH5Writer:
             self._indices_arr.append(gene_indices.astype(np.int32))
         self._indptr.append(self._indptr[-1] + len(counts))
 
+    def append_batch(self, batch: "sp.csr_matrix") -> None:
+        """Append non-zero entries for a batch of barcodes in a single EArray call.
+
+        ``batch`` must be a CSR matrix of shape ``(batch_size, n_genes)`` where
+        non-cell rows have already been zeroed.  All rows advance ``_indptr``
+        regardless of their nnz count.  Call batches in ascending barcode order.
+        """
+        assert self._data_arr is not None and self._indices_arr is not None
+        if batch.nnz > 0:
+            self._data_arr.append(batch.data.astype(np.int32))
+            self._indices_arr.append(batch.indices.astype(np.int32))
+        row_nnzs = np.diff(batch.indptr)
+        last = self._indptr[-1]
+        self._indptr.extend((last + np.cumsum(row_nnzs)).tolist())
+
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         if self._f is None:
             return
@@ -481,7 +496,6 @@ def stream_denoised_to_cellranger_h5(
     noise_parquet_path: Path,
     raw_count_matrix: "sp.csr_matrix",
     output_file: str,
-    analyzed_gene_inds: np.ndarray,
     cell_logic: np.ndarray,
     analyzed_barcode_inds: np.ndarray,
     gene_names: np.ndarray,
@@ -501,28 +515,27 @@ def stream_denoised_to_cellranger_h5(
     Workflow:
     1. Re-sort the noise parquet by ``(cell_id, gene_id)`` using DuckDB so
        that barcode-range queries are efficient via row-group min/max pushdown.
-    2. Iterate barcodes in ``barcode_subset`` in batches, fetching each
-       batch's noise counts from the re-sorted parquet.
+    2. Iterate barcodes in ``barcode_subset`` in batches.  For each batch:
+       a. Slice the raw CSR matrix once: ``raw_csr[batch_bcs, :]``.
+       b. Query noise parquet for the batch's local cell-ID range.
+       c. Build a noise CSR matrix in absolute-gene column space.
+       d. Subtract, apply a per-row cell mask (zeros empty-barcode rows),
+          clamp negatives to zero.
+       e. Write the whole batch to H5 via :meth:`IncrementalH5Writer.append_batch`.
     3. For each barcode: subtract noise from raw (analyzed genes); keep raw
        for non-analyzed genes; zero out non-cells.
-    4. Write barcode vectors incrementally to :class:`IncrementalH5Writer`.
-       The full denoised matrix is never held in RAM simultaneously.
+    4. The full denoised matrix is never held in RAM simultaneously.
 
-    The noise parquet uses *local* indices produced by ``estimate_noise_to_parquet``:
-    - ``cell_id``: index into ``analyzed_barcode_inds``
-    - ``gene_id``: index into ``analyzed_gene_inds``
-
-    Non-analysed genes use raw counts for cell barcodes (empty barcodes zeroed),
-    mirroring
-    :meth:`~SingleCellRNACountsDataset.restore_eliminated_features_in_cells`.
+    The noise parquet uses *absolute* indices:
+    - ``cell_id``: absolute barcode index (row in the full raw count matrix)
+    - ``gene_id``: absolute gene index (column in the full raw count matrix)
 
     Args:
         noise_parquet_path: Parquet with ``(cell_id, gene_id, noise_count)``
-            sorted by ``(gene_id, cell_id)`` (local indices).
+            sorted by ``(gene_id, cell_id)`` (absolute indices).
         raw_count_matrix: Full raw count matrix, shape
             ``(total_barcodes, total_genes)`` — CSR or CSC.
         output_file: Destination ``.h5`` path.
-        analyzed_gene_inds: Absolute gene indices included in analysis.
         cell_logic: Boolean mask of length ``len(analyzed_barcode_inds)``
             where True marks a cell.
         analyzed_barcode_inds: Absolute barcode indices that were analysed.
@@ -543,15 +556,8 @@ def stream_denoised_to_cellranger_h5(
 
     total_barcodes = raw_count_matrix.shape[0]
     total_genes = raw_count_matrix.shape[1]
-    analyzed_gene_set = set(analyzed_gene_inds.tolist())
 
-    # Local → absolute index maps for the noise parquet lookups.
-    abs_to_local_gene: Dict[int, int] = {
-        int(analyzed_gene_inds[i]): i for i in range(len(analyzed_gene_inds))
-    }
-    abs_to_local_cell: Dict[int, int] = {
-        int(analyzed_barcode_inds[i]): i for i in range(len(analyzed_barcode_inds))
-    }
+    # Set of absolute barcode indices that are cells (for noise-subtraction masking).
     cell_absolute: set = set(analyzed_barcode_inds[cell_logic].tolist())
 
     if barcode_subset is None:
@@ -579,7 +585,7 @@ def stream_denoised_to_cellranger_h5(
         f" TO '{bc_sorted_str}' (FORMAT PARQUET, COMPRESSION 'snappy')"
     )
 
-    # Step 2: Stream barcode-by-barcode, write to H5.
+    # Step 2: Stream barcodes in batches, write to H5.
     try:
         with IncrementalH5Writer(
             output_file=output_file,
@@ -597,65 +603,75 @@ def stream_denoised_to_cellranger_h5(
             for batch_start in range(0, n_out_barcodes, barcode_batch_size):
                 batch_end = min(batch_start + barcode_batch_size, n_out_barcodes)
                 batch_bcs = barcode_subset[batch_start:batch_end]
+                batch_size = batch_end - batch_start
 
-                # Collect local cell_ids for analyzed cells in this batch.
-                batch_local_ids: List[Optional[int]] = []
-                analyzed_local_in_batch: List[int] = []
-                for bc in batch_bcs:
-                    lid = abs_to_local_cell.get(int(bc))
-                    batch_local_ids.append(lid)
-                    if lid is not None and int(bc) in cell_absolute:
-                        analyzed_local_in_batch.append(lid)
+                # One sparse matrix slice for the entire batch.
+                raw_batch = raw_csr[batch_bcs, :]  # (batch_size, total_genes)
 
-                # Query bc-sorted parquet for this batch's range of local cell_ids.
-                noise_by_cell: Dict[int, Dict[int, float]] = {}
-                if analyzed_local_in_batch:
-                    min_lid = min(analyzed_local_in_batch)
-                    max_lid = max(analyzed_local_in_batch)
+                # Map absolute cell barcode → row position within this batch.
+                local_to_batch_row: Dict[int, int] = {}
+                for i, bc in enumerate(batch_bcs.tolist()):
+                    if bc in cell_absolute:
+                        local_to_batch_row[bc] = i
+
+                # Build noise sparse matrix from DuckDB query.
+                noise_csr: sp.csr_matrix = sp.csr_matrix(
+                    (batch_size, total_genes), dtype=raw_batch.dtype
+                )
+                if local_to_batch_row:
+                    min_lid = min(local_to_batch_row)
+                    max_lid = max(local_to_batch_row)
                     noise_df = conn.execute(
                         f"SELECT cell_id, gene_id, noise_count "
                         f"FROM read_parquet('{bc_sorted_str}') "
                         f"WHERE cell_id >= {min_lid} AND cell_id <= {max_lid}"
                     ).df()
-                    for row in noise_df.itertuples(index=False):
-                        cid = int(row.cell_id)
-                        if cid not in noise_by_cell:
-                            noise_by_cell[cid] = {}
-                        noise_by_cell[cid][int(row.gene_id)] = float(row.noise_count)
+                    if len(noise_df) > 0:
+                        # Range query may include cell IDs between min and max that are
+                        # not actually in this batch; filter them out.
+                        in_batch = noise_df["cell_id"].isin(local_to_batch_row)
+                        if in_batch.any():
+                            noise_df = noise_df[in_batch]
+                            noise_rows = (
+                                noise_df["cell_id"].map(local_to_batch_row).to_numpy()
+                            )
+                            noise_cols = noise_df["gene_id"].to_numpy()
+                            noise_data = noise_df["noise_count"].to_numpy().astype(
+                                raw_batch.dtype
+                            )
+                            noise_csr = sp.csr_matrix(
+                                (noise_data, (noise_rows, noise_cols)),
+                                shape=(batch_size, total_genes),
+                            )
                     del noise_df
 
-                for i, (bc, local_id) in enumerate(zip(batch_bcs.tolist(), batch_local_ids)):
-                    bc_int = int(bc)
-                    out_row = batch_start + i
+                # Subtract noise from raw counts.
+                denoised_batch: sp.csr_matrix = (raw_batch - noise_csr).tocsr()
 
-                    if bc_int not in cell_absolute:
-                        # Empty barcode → zero counts.
-                        writer.append_barcode(out_row, np.empty(0, np.int32), np.empty(0, np.int32))
-                        continue
-
-                    raw_row = raw_csr.getrow(bc_int)
-                    noise_dict = noise_by_cell.get(local_id, {}) if local_id is not None else {}
-
-                    gene_idx_out: List[int] = []
-                    cnts_out: List[int] = []
-
-                    for abs_g, raw_c in zip(raw_row.indices.tolist(), raw_row.data.tolist()):
-                        if abs_g in analyzed_gene_set:
-                            local_g = abs_to_local_gene[abs_g]
-                            noise_c = int(round(noise_dict.get(local_g, 0.0)))
-                            denoised = max(0, int(raw_c) - noise_c)
-                        else:
-                            denoised = int(raw_c)  # non-analyzed gene: keep raw for cells
-                        if denoised > 0:
-                            gene_idx_out.append(abs_g)
-                            cnts_out.append(denoised)
-                            denoised_per_barcode[out_row] += denoised
-
-                    writer.append_barcode(
-                        out_row,
-                        np.array(gene_idx_out, dtype=np.int32),
-                        np.array(cnts_out, dtype=np.int32),
+                # Zero non-cell rows: multiply each stored value by its row's
+                # cell mask (1 for cells, 0 for empties) using vectorised indexing.
+                if denoised_batch.nnz > 0:
+                    cell_mask = np.zeros(batch_size, dtype=denoised_batch.dtype)
+                    for row_i in local_to_batch_row.values():
+                        cell_mask[row_i] = 1
+                    row_of_each_nnz = np.repeat(
+                        np.arange(batch_size, dtype=np.intp),
+                        np.diff(denoised_batch.indptr),
                     )
+                    denoised_batch.data *= cell_mask[row_of_each_nnz]
+
+                # Clamp negatives to zero and drop explicit zeros.
+                np.clip(denoised_batch.data, 0, None, out=denoised_batch.data)
+                denoised_batch.eliminate_zeros()
+
+                # Accumulate denoised totals per output barcode.
+                row_sums = np.asarray(denoised_batch.sum(axis=1)).ravel()
+                denoised_per_barcode[batch_start:batch_end] = row_sums.astype(
+                    np.int64
+                )
+
+                # Batch write — one EArray.append call for the whole batch.
+                writer.append_batch(denoised_batch)
     finally:
         conn.close()
         try:

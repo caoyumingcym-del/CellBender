@@ -5,8 +5,11 @@ import shutil
 from typing import Dict, Generator, List, Optional, Tuple
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import scipy.sparse as sp
+import tables
 from conftest import sparse_matrix_equal, string_ndarray_equality
 from scipy.io import mmwrite
 
@@ -216,3 +219,126 @@ def test_unravel_dict():
     answer = {"pref_a": 1, "pref_b_c": 2, "pref_b_d_e": 3, "pref_b_d_f": 4}
     d = unravel_dict(key, value)
     assert d == answer, "unravel_dict failed to produce correct output"
+
+
+@pytest.mark.parametrize("barcode_batch_size", [1, 3], ids=["batch_1", "batch_3"])
+def test_stream_denoised_to_cellranger_h5(tmp_path_factory, barcode_batch_size):
+    """Vectorized batch H5 write produces correct denoised output."""
+    import scipy.sparse as sp
+
+    from cellbender.remove_background.data.io import stream_denoised_to_cellranger_h5
+
+    # Layout:
+    #   6 absolute barcodes × 8 genes
+    #   analyzed barcodes: 0-4 (barcode 5 is outside the analysis window)
+    #   analyzed genes:    0-5 (genes 6-7 are non-analyzed)
+    #   cells:             barcodes 1, 3, 4  (local ids 1, 3, 4)
+    n_barcodes = 6
+    n_genes = 8
+    analyzed_barcode_inds = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+    cell_logic = np.array([False, True, False, True, True])
+
+    raw_data = np.array(
+        [
+            [0, 0, 0, 0, 0, 0, 5, 3],  # bc 0: non-cell (not analyzed)
+            [2, 5, 0, 3, 1, 0, 0, 0],  # bc 1: cell
+            [0, 0, 1, 0, 0, 0, 0, 0],  # bc 2: analyzed empty
+            [4, 0, 2, 0, 8, 1, 1, 0],  # bc 3: cell (gene 6 non-analyzed raw=1)
+            [1, 1, 1, 1, 1, 1, 0, 1],  # bc 4: cell (gene 7 non-analyzed raw=1)
+            [3, 0, 0, 0, 0, 0, 0, 0],  # bc 5: not analyzed
+        ],
+        dtype=np.int32,
+    )
+    raw_csr = sp.csr_matrix(raw_data)
+
+    # Noise parquet (absolute gene ids, absolute cell ids — same as local here since
+    # analyzed_barcode_inds and analyzed_gene_inds start from 0):
+    #   bc1: gene 0 → noise 2,  gene 1 → noise 3
+    #   bc3: gene 0 → noise 1,  gene 4 → noise 10 (> raw 8, must clamp)
+    #   bc4: gene 2 → noise 1
+    noise_cell_ids = np.array([1, 1, 3, 3, 4], dtype=np.int32)
+    noise_gene_ids = np.array([0, 1, 0, 4, 2], dtype=np.int32)
+    noise_counts = np.array([2, 3, 1, 10, 1], dtype=np.int32)
+
+    tmp_dir = tmp_path_factory.mktemp("stream_h5")
+    noise_path = tmp_dir / "noise.parquet"
+    output_path = str(tmp_dir / "out.h5")
+
+    # Write gene-sorted noise parquet (as MCKP would produce).
+    sort_order = np.lexsort((noise_cell_ids, noise_gene_ids))
+    pq.write_table(
+        pa.table(
+            {
+                "cell_id": pa.array(noise_cell_ids[sort_order], type=pa.int32()),
+                "gene_id": pa.array(noise_gene_ids[sort_order], type=pa.int32()),
+                "noise_count": pa.array(noise_counts[sort_order], type=pa.int32()),
+            }
+        ),
+        noise_path,
+    )
+
+    gene_names = np.array([f"Gene{i}" for i in range(n_genes)])
+    barcodes_arr = np.array([f"BC{i}" for i in range(n_barcodes)])
+
+    denoised_per_bc = stream_denoised_to_cellranger_h5(
+        noise_parquet_path=noise_path,
+        raw_count_matrix=raw_csr,
+        output_file=output_path,
+        cell_logic=cell_logic,
+        analyzed_barcode_inds=analyzed_barcode_inds,
+        gene_names=gene_names,
+        barcodes=barcodes_arr,
+        barcode_batch_size=barcode_batch_size,
+    )
+
+    # Read back: H5 stores shape [n_genes, n_barcodes] CSC transposed.
+    with tables.open_file(output_path, "r") as f:
+        data = f.root.matrix.data[:]
+        indices = f.root.matrix.indices[:]
+        indptr = f.root.matrix.indptr[:]
+        shape = f.root.matrix.shape[:]
+    import scipy.sparse as sp2
+
+    written = sp2.csc_matrix((data, indices, indptr), shape=tuple(shape)).T.toarray()
+
+    # bc 0: not a cell → all zeros
+    assert np.all(written[0] == 0), "non-cell barcode must be all zeros"
+
+    # bc 1: cell, noise: gene0-=2, gene1-=3; raw=[2,5,0,3,1,0,0,0]
+    # expected: [0, 2, 0, 3, 1, 0, 0, 0]
+    assert written[1, 0] == 0  # 2 - 2 = 0
+    assert written[1, 1] == 2  # 5 - 3 = 2
+    assert written[1, 3] == 3  # no noise → keeps raw
+    assert written[1, 6] == 0  # non-analyzed but raw is 0
+
+    # bc 2: analyzed empty → all zeros
+    assert np.all(written[2] == 0), "analyzed empty must be all zeros"
+
+    # bc 3: cell, noise: gene0-=1 (3), gene4-=10 (clamped); non-analyzed gene6 raw=1 kept
+    assert written[3, 0] == 3  # 4 - 1
+    assert written[3, 4] == 0  # 8 - 10 clamped
+    assert written[3, 6] == 1  # non-analyzed gene keeps raw for cells
+
+    # bc 4: cell, noise: gene2-=1; non-analyzed gene7 raw=1 kept
+    assert written[4, 2] == 0  # 1 - 1 = 0
+    assert written[4, 7] == 1  # non-analyzed gene keeps raw for cells
+
+    # bc 5: not analyzed → all zeros
+    assert np.all(written[5] == 0), "unanalyzed barcode must be all zeros"
+
+    # No negatives anywhere.
+    assert np.all(written >= 0), "denoised counts must be non-negative"
+
+    # denoised_per_barcode sums must match.
+    expected = np.array(
+        [
+            0,  # bc 0
+            0 + 2 + 0 + 3 + 1 + 0 + 0 + 0,  # bc 1
+            0,  # bc 2
+            3 + 0 + 2 + 0 + 0 + 1 + 1 + 0,  # bc 3 (non-analyzed gene6=1)
+            1 + 1 + 0 + 1 + 1 + 1 + 0 + 1,  # bc 4 (non-analyzed gene7=1)
+            0,  # bc 5
+        ],
+        dtype=np.int64,
+    )
+    np.testing.assert_array_equal(denoised_per_bc, expected)
