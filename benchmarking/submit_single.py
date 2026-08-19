@@ -36,10 +36,39 @@ def build_dev_job_script(
     output_gcs_dir: str,
     extra_args: str,
     checkpoint_gcs: str = "",
+    checkpoint_copy_interval: int = 300,
 ) -> str:
     lines = _build_preamble_lines(git_hash, input_gcs)
     if checkpoint_gcs:
         lines.append(f"gsutil cp {checkpoint_gcs} /tmp/checkpoint.tar.gz")
+
+    # CellBender writes the checkpoint to this path (matches --checkpoint arg when
+    # resuming, or the library default ckpt.tar.gz for a fresh run).
+    ckpt_local = "/tmp/checkpoint.tar.gz" if checkpoint_gcs else "/tmp/ckpt.tar.gz"
+
+    # _cleanup fires via EXIT trap on both success and failure (including CUDA OOM,
+    # which exits via a Python exception rather than SIGKILL). It kills the periodic
+    # sidecar and does one final checkpoint copy so the last-written tarball is
+    # always uploaded even when the main outputs copy never runs.
+    lines += [
+        'CKPT_SIDECAR_PID=""',
+        (
+            "_cleanup() {\n"
+            "    set +e\n"
+            f'    [[ -n "$CKPT_SIDECAR_PID" ]] && kill "$CKPT_SIDECAR_PID" 2>/dev/null\n'
+            f"    [[ -f {ckpt_local} ]] && gsutil cp {ckpt_local} {output_gcs_dir}/ 2>/dev/null\n"
+            "}"
+        ),
+        "trap _cleanup EXIT",
+        (
+            f"while true; do"
+            f" sleep {checkpoint_copy_interval};"
+            f" [[ -f {ckpt_local} ]] && gsutil cp {ckpt_local} {output_gcs_dir}/ 2>/dev/null || true;"
+            f" done &"
+        ),
+        "CKPT_SIDECAR_PID=$!",
+    ]
+
     cmd_parts = [
         "cellbender remove-background",
         "    --input /tmp/input.h5",
@@ -53,7 +82,6 @@ def build_dev_job_script(
         cmd_parts.append(f"    {extra_args.strip()}")
     lines.append(" \\\n".join(cmd_parts))
     lines.append(f"gsutil -m cp /tmp/{sample}_out* {output_gcs_dir}/")
-    lines.append(f"gsutil -m cp /tmp/*.tar.gz {output_gcs_dir}/")
     return "\n".join(lines)
 
 
