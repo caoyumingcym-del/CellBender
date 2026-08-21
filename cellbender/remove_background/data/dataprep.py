@@ -14,7 +14,7 @@ Key properties:
 
 import logging
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import scipy.sparse as sp
@@ -111,7 +111,7 @@ class CellEmptyBatchSampler(torch.utils.data.Sampler):
         self.original_empty_indices = original_empty_indices
         # Mutable epoch state.
         self._perm: Optional[np.ndarray] = None  # cell permutation for current epoch
-        self._ptr: int = 0                       # batches already emitted this epoch
+        self._ptr: int = 0  # batches already emitted this epoch
 
     # ------------------------------------------------------------------
     # Length (analytical — no iteration needed)
@@ -146,9 +146,7 @@ class CellEmptyBatchSampler(torch.utils.data.Sampler):
                 break
 
             if self._n_empties > 0 and self._n_empty_per_batch > 0:
-                empty_local = torch.randint(
-                    self._n_empties, (self._n_empty_per_batch,), generator=self._gen
-                ).numpy()
+                empty_local = torch.randint(self._n_empties, (self._n_empty_per_batch,), generator=self._gen).numpy()
                 batch = np.concatenate([cell_chunk, empty_local + self._n_cells]).tolist()
             else:
                 batch = cell_chunk.tolist()
@@ -550,5 +548,6 @@ def reconstruct_loader(
 def sparse_collate(batch: List[sp.csr_matrix]) -> torch.Tensor:
     """Stack a list of sparse CSR matrices into a dense float32 tensor."""
     import scipy.sparse as _sp
+
     mat = _sp.vstack(batch, format="csr")
     return torch.from_numpy(np.asarray(mat.todense(), dtype=np.float32))

@@ -1,12 +1,12 @@
 """Handle input parsing and output writing."""
 
+import gzip
 import json
 import logging
 import os
-import gzip
 import traceback
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import anndata
 import duckdb
@@ -14,14 +14,13 @@ import numpy as np
 import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
-import scipy.sparse as sp
 import scipy.io as io
+import scipy.sparse as sp
 import tables
 
 from cellbender.remove_background import consts
 
-
-logger = logging.getLogger('cellbender')
+logger = logging.getLogger("cellbender")
 
 
 class IngestedData(dict):
@@ -33,11 +32,9 @@ class IngestedData(dict):
     force each loader to specify each field
     """
 
-    def __init__(self, matrix, barcodes,
-                 gene_names, gene_ids, feature_types, genomes,
-                 **kwargs):
+    def __init__(self, matrix, barcodes, gene_names, gene_ids, feature_types, genomes, **kwargs):
         # Fill in some fields no matter the input source (for loading in scanpy)
-        blank_array = np.array(['NA'] * len(gene_names))
+        blank_array = np.array(["NA"] * len(gene_names))
         if genomes is None:
             genomes = blank_array
         if gene_ids is None:
@@ -47,17 +44,23 @@ class IngestedData(dict):
 
         # Warn if file looks filtered.
         if len(barcodes) < consts.MINIMUM_BARCODES_H5AD:
-            logger.warning(f'WARNING: Only {len(barcodes)} barcodes in the input file. '
-                           f'Ensure this is a raw (unfiltered) file with all barcodes, '
-                           f'including the empty droplets.')
+            logger.warning(
+                f"WARNING: Only {len(barcodes)} barcodes in the input file. "
+                f"Ensure this is a raw (unfiltered) file with all barcodes, "
+                f"including the empty droplets."
+            )
 
         # Required values, some of which can be None
-        super().__init__([('matrix', matrix),
-                          ('barcodes', barcodes),
-                          ('gene_names', gene_names),
-                          ('gene_ids', gene_ids),
-                          ('feature_types', feature_types),
-                          ('genomes', genomes)])
+        super().__init__(
+            [
+                ("matrix", matrix),
+                ("barcodes", barcodes),
+                ("gene_names", gene_names),
+                ("gene_ids", gene_ids),
+                ("feature_types", feature_types),
+                ("genomes", genomes),
+            ]
+        )
         self.update(**kwargs)  # cellranger version, for example, is optional
 
 
@@ -73,17 +76,18 @@ class FileLoader:
 
 
 def write_matrix_to_cellranger_h5(
-        cellranger_version: int,
-        output_file: str,
-        gene_names: np.ndarray,
-        barcodes: np.ndarray,
-        count_matrix: sp.csc_matrix,
-        feature_types: Optional[np.ndarray] = None,
-        gene_ids: Optional[np.ndarray] = None,
-        genomes: Optional[np.ndarray] = None,
-        local_latents: Dict[str, Optional[np.ndarray]] = {},
-        global_latents: Dict[str, Optional[np.ndarray]] = {},
-        metadata: Dict[str, Optional[Union[np.ndarray, int, float, str, Dict]]] = {}) -> bool:
+    cellranger_version: int,
+    output_file: str,
+    gene_names: np.ndarray,
+    barcodes: np.ndarray,
+    count_matrix: sp.csc_matrix,
+    feature_types: Optional[np.ndarray] = None,
+    gene_ids: Optional[np.ndarray] = None,
+    genomes: Optional[np.ndarray] = None,
+    local_latents: Dict[str, Optional[np.ndarray]] = {},
+    global_latents: Dict[str, Optional[np.ndarray]] = {},
+    metadata: Dict[str, Optional[Union[np.ndarray, int, float, str, Dict]]] = {},
+) -> bool:
     """Write count matrix data to output HDF5 file using CellRanger format.
 
     Args:
@@ -108,40 +112,39 @@ def write_matrix_to_cellranger_h5(
 
     """
 
-    assert isinstance(count_matrix, sp.csc_matrix), \
+    assert isinstance(count_matrix, sp.csc_matrix), (
         "The count matrix must be csc_matrix format in order to write to HDF5."
+    )
 
-    assert gene_names.size == count_matrix.shape[1], \
+    assert gene_names.size == count_matrix.shape[1], (
         "The number of gene names must match the number of columns in the count matrix."
+    )
 
     if gene_ids is not None:
-        assert gene_names.size == gene_ids.size, \
-            f"The number of gene_names {gene_names.shape} must match " \
-            f"the number of gene_ids {gene_ids.shape}."
+        assert gene_names.size == gene_ids.size, (
+            f"The number of gene_names {gene_names.shape} must match the number of gene_ids {gene_ids.shape}."
+        )
 
     if feature_types is not None:
-        assert gene_names.size == feature_types.size, \
-            f"The number of gene_names {gene_names.shape} must match " \
-            f"the number of feature_types {feature_types.shape}."
+        assert gene_names.size == feature_types.size, (
+            f"The number of gene_names {gene_names.shape} must match the number of feature_types {feature_types.shape}."
+        )
 
     if genomes is not None:
-        assert gene_names.size == genomes.size, \
-            "The number of gene_names must match the number of genome designations."
+        assert gene_names.size == genomes.size, "The number of gene_names must match the number of genome designations."
 
-    assert barcodes.size == count_matrix.shape[0], \
+    assert barcodes.size == count_matrix.shape[0], (
         "The number of barcodes must match the number of rows in the count matrix."
+    )
 
     # This reverses the role of rows and columns, to match CellRanger format.
     count_matrix = count_matrix.transpose().tocsc()
 
     # Write to output file.
-    filters = tables.Filters(complevel=1, complib='zlib', shuffle=True)
-    filter_noshuffle = tables.Filters(complevel=1, complib='zlib', shuffle=False)
-    with tables.open_file(output_file, "w",
-                          title="CellBender remove-background output") as f:
-
+    filters = tables.Filters(complevel=1, complib="zlib", shuffle=True)
+    filter_noshuffle = tables.Filters(complevel=1, complib="zlib", shuffle=False)
+    with tables.open_file(output_file, "w", title="CellBender remove-background output") as f:
         if cellranger_version == 2:
-
             # Create the group where count data will be stored
             group = f.create_group("/", "matrix_v2", "Counts after background correction")
 
@@ -149,40 +152,37 @@ def write_matrix_to_cellranger_h5(
             f.create_carray(group, "gene_names", obj=gene_names, filters=filters)
             if gene_ids is None:
                 # some R loaders require unique values here
-                gene_ids = np.array([f'NA_{i}' for i in range(gene_names.size)])
+                gene_ids = np.array([f"NA_{i}" for i in range(gene_names.size)])
             f.create_carray(group, "genes", obj=gene_ids, filters=filters)
             if genomes is None:
-                genomes = np.array(['NA'] * gene_names.size)
+                genomes = np.array(["NA"] * gene_names.size)
             f.create_carray(group, "genome", obj=genomes, filters=filters)
 
         elif cellranger_version == 3:
-
             # Create the group where count data will be stored
             group = f.create_group("/", "matrix", "Counts after background correction")
 
             # Create a sub-group called "features"
-            feature_group = f.create_group(group, "features",
-                                           "Genes and other features measured")
+            feature_group = f.create_group(group, "features", "Genes and other features measured")
 
             # Create arrays within that group for feature info.
             f.create_carray(feature_group, "name", obj=gene_names, filters=filters)
             if gene_ids is None:
                 # some R loaders require unique values here
-                gene_ids = np.array([f'NA_{i}' for i in range(gene_names.size)])
+                gene_ids = np.array([f"NA_{i}" for i in range(gene_names.size)])
             f.create_carray(feature_group, "id", obj=gene_ids, filters=filters)
             if feature_types is None:
-                feature_types = np.array(['Gene Expression'] * gene_names.size)
+                feature_types = np.array(["Gene Expression"] * gene_names.size)
             f.create_carray(feature_group, "feature_type", obj=feature_types, filters=filters)
             if genomes is None:
-                genomes = np.array(['NA'] * gene_names.size)
+                genomes = np.array(["NA"] * gene_names.size)
             f.create_carray(feature_group, "genome", obj=genomes, filters=filters)
 
             # TODO: Copy the other extraneous information from the input file.
             # (Some user might need it for some reason.)
 
         else:
-            raise ValueError(f'Trying to save to CellRanger v{cellranger_version} '
-                             f'format, which is not implemented.')
+            raise ValueError(f"Trying to save to CellRanger v{cellranger_version} format, which is not implemented.")
 
         # Code for both versions.
         f.create_carray(group, "barcodes", obj=barcodes, filters=filter_noshuffle)
@@ -191,8 +191,9 @@ def write_matrix_to_cellranger_h5(
         f.create_carray(group, "data", obj=count_matrix.data, filters=filters)
         f.create_carray(group, "indices", obj=count_matrix.indices, filters=filters)
         f.create_carray(group, "indptr", obj=count_matrix.indptr, filters=filters)
-        f.create_carray(group, "shape", atom=tables.Int32Atom(),
-                        obj=np.array(count_matrix.shape, dtype=np.int32), filters=filters)
+        f.create_carray(
+            group, "shape", atom=tables.Int32Atom(), obj=np.array(count_matrix.shape, dtype=np.int32), filters=filters
+        )
 
         # Store local latent variables.
         droplet_latent_group = f.create_group("/", "droplet_latents", "Latent variables per droplet")
@@ -210,7 +211,7 @@ def write_matrix_to_cellranger_h5(
             """Wrap scalar or string values in lists"""
             if v is None:
                 return
-            if (type(v) == list) or (type(v) == np.ndarray):
+            if isinstance(v, (list, np.ndarray)):
                 f.create_array(group, k, v)
             else:
                 f.create_array(group, k, [v])
@@ -221,8 +222,7 @@ def write_matrix_to_cellranger_h5(
             for k, v in unravel_dict(meta_key, meta_value).items():
                 create_nonscalar_metadata_array(f, metadata_group, k, v)
 
-    logger.info(f"Succeeded in writing CellRanger "
-                f"format output to file {output_file}")
+    logger.info(f"Succeeded in writing CellRanger format output to file {output_file}")
 
     return True
 
@@ -231,12 +231,14 @@ def write_matrix_to_cellranger_h5(
 # Parquet-based posterior IO
 # ---------------------------------------------------------------------------
 
-POSTERIOR_SCHEMA = pa.schema([
-    pa.field('cell_id',  pa.int32()),
-    pa.field('gene_id',  pa.int32()),
-    pa.field('c',        pa.int32()),
-    pa.field('log_prob', pa.float32()),
-])
+POSTERIOR_SCHEMA = pa.schema(
+    [
+        pa.field("cell_id", pa.int32()),
+        pa.field("gene_id", pa.int32()),
+        pa.field("c", pa.int32()),
+        pa.field("log_prob", pa.float32()),
+    ]
+)
 
 
 def _make_duckdb_conn(
@@ -263,27 +265,26 @@ def _make_duckdb_conn(
 
 
 def write_posterior_batch_to_parquet(
-        writer: pq.ParquetWriter,
-        cell_ids: np.ndarray,
-        gene_ids: np.ndarray,
-        c_vals: np.ndarray,
-        log_probs: np.ndarray) -> None:
+    writer: pq.ParquetWriter, cell_ids: np.ndarray, gene_ids: np.ndarray, c_vals: np.ndarray, log_probs: np.ndarray
+) -> None:
     """Stream one batch of posterior rows into an open ParquetWriter."""
-    batch = pa.table({
-        'cell_id':  pa.array(cell_ids.astype(np.int32),    type=pa.int32()),
-        'gene_id':  pa.array(gene_ids.astype(np.int32),    type=pa.int32()),
-        'c':        pa.array(c_vals.astype(np.int32),      type=pa.int32()),
-        'log_prob': pa.array(log_probs.astype(np.float32), type=pa.float32()),
-    })
+    batch = pa.table(
+        {
+            "cell_id": pa.array(cell_ids.astype(np.int32), type=pa.int32()),
+            "gene_id": pa.array(gene_ids.astype(np.int32), type=pa.int32()),
+            "c": pa.array(c_vals.astype(np.int32), type=pa.int32()),
+            "log_prob": pa.array(log_probs.astype(np.float32), type=pa.float32()),
+        }
+    )
     writer.write_table(batch)
 
 
 def sort_posterior_parquet(path: Path, duckdb_memory_limit: Optional[str] = None) -> None:
     """Re-write the posterior parquet sorted by (gene_id, cell_id) for efficient DuckDB scans."""
-    tmp = Path(str(path) + '.tmp')
+    tmp = Path(str(path) + ".tmp")
     path_str = str(path).replace("'", "''")
-    tmp_str  = str(tmp).replace("'", "''")
-    tmp_dir  = str(path.parent).replace("'", "''")
+    tmp_str = str(tmp).replace("'", "''")
+    tmp_dir = str(path.parent).replace("'", "''")
     conn = _make_duckdb_conn(tmp_dir, memory_limit=duckdb_memory_limit)
     conn.execute(
         f"COPY (SELECT * FROM read_parquet('{path_str}') ORDER BY gene_id, cell_id) "
@@ -342,8 +343,8 @@ class IncrementalH5Writer:
         self._indptr: List[int] = [0]  # cumulative nnz per gene column
 
     def __enter__(self) -> "IncrementalH5Writer":
-        filters = tables.Filters(complevel=1, complib='zlib', shuffle=True)
-        filter_noshuffle = tables.Filters(complevel=1, complib='zlib', shuffle=False)
+        filters = tables.Filters(complevel=1, complib="zlib", shuffle=True)
+        filter_noshuffle = tables.Filters(complevel=1, complib="zlib", shuffle=False)
 
         self._f = tables.open_file(self.output_file, "w", title="CellBender remove-background output")
         f = self._f
@@ -354,9 +355,9 @@ class IncrementalH5Writer:
         self._group = group
         feature_group = f.create_group(group, "features", "Genes and other features measured")
 
-        gene_ids = self.gene_ids if self.gene_ids is not None else np.array([f'NA_{i}' for i in range(self.n_genes)])
-        ft = self.feature_types if self.feature_types is not None else np.array(['Gene Expression'] * self.n_genes)
-        genomes = self.genomes if self.genomes is not None else np.array(['NA'] * self.n_genes)
+        gene_ids = self.gene_ids if self.gene_ids is not None else np.array([f"NA_{i}" for i in range(self.n_genes)])
+        ft = self.feature_types if self.feature_types is not None else np.array(["Gene Expression"] * self.n_genes)
+        genomes = self.genomes if self.genomes is not None else np.array(["NA"] * self.n_genes)
 
         f.create_carray(feature_group, "name", obj=self.gene_names, filters=filters)
         f.create_carray(feature_group, "id", obj=gene_ids, filters=filters)
@@ -411,7 +412,7 @@ class IncrementalH5Writer:
             if exc_type is None:
                 f = self._f
                 group = self._group
-                filters = tables.Filters(complevel=1, complib='zlib', shuffle=True)
+                filters = tables.Filters(complevel=1, complib="zlib", shuffle=True)
 
                 # Pad indptr for any barcodes not covered by append_barcode calls.
                 last = self._indptr[-1]
@@ -422,8 +423,13 @@ class IncrementalH5Writer:
                 # CellRanger convention: shape [n_genes, n_barcodes] — the stored
                 # CSC has genes as rows and barcodes as columns; anndata_from_h5
                 # reads this and transposes to get barcodes × genes.
-                f.create_carray(group, "shape", atom=tables.Int32Atom(),
-                                obj=np.array([self.n_genes, self.n_barcodes], dtype=np.int32), filters=filters)
+                f.create_carray(
+                    group,
+                    "shape",
+                    atom=tables.Int32Atom(),
+                    obj=np.array([self.n_genes, self.n_barcodes], dtype=np.int32),
+                    filters=filters,
+                )
 
                 # Local latent variables.
                 droplet_latent_group = f.create_group("/", "droplet_latents", "Latent variables per droplet")
@@ -476,6 +482,7 @@ def compute_noise_totals_per_barcode(
         noise_per_barcode: 1-D float64 array of shape ``(total_n_barcodes,)``.
     """
     import duckdb as _duckdb
+
     conn = _duckdb.connect()
     tmp_dir = str(noise_parquet_path.parent).replace("'", "''")
     conn.execute(f"SET temp_directory='{tmp_dir}'")
@@ -483,8 +490,7 @@ def compute_noise_totals_per_barcode(
         conn.execute(f"SET memory_limit='{duckdb_memory_limit}'")
     noise_str = str(noise_parquet_path).replace("'", "''")
     df = conn.execute(
-        f"SELECT cell_id, SUM(noise_count) AS total_noise "
-        f"FROM read_parquet('{noise_str}') GROUP BY cell_id"
+        f"SELECT cell_id, SUM(noise_count) AS total_noise FROM read_parquet('{noise_str}') GROUP BY cell_id"
     ).df()
     result = np.zeros(total_n_barcodes, dtype=np.float64)
     if len(df) > 0:
@@ -615,9 +621,7 @@ def stream_denoised_to_cellranger_h5(
                         local_to_batch_row[bc] = i
 
                 # Build noise sparse matrix from DuckDB query.
-                noise_csr: sp.csr_matrix = sp.csr_matrix(
-                    (batch_size, total_genes), dtype=raw_batch.dtype
-                )
+                noise_csr: sp.csr_matrix = sp.csr_matrix((batch_size, total_genes), dtype=raw_batch.dtype)
                 if local_to_batch_row:
                     min_lid = min(local_to_batch_row)
                     max_lid = max(local_to_batch_row)
@@ -632,13 +636,9 @@ def stream_denoised_to_cellranger_h5(
                         in_batch = noise_df["cell_id"].isin(local_to_batch_row)
                         if in_batch.any():
                             noise_df = noise_df[in_batch]
-                            noise_rows = (
-                                noise_df["cell_id"].map(local_to_batch_row).to_numpy()
-                            )
+                            noise_rows = noise_df["cell_id"].map(local_to_batch_row).to_numpy()
                             noise_cols = noise_df["gene_id"].to_numpy()
-                            noise_data = noise_df["noise_count"].to_numpy().astype(
-                                raw_batch.dtype
-                            )
+                            noise_data = noise_df["noise_count"].to_numpy().astype(raw_batch.dtype)
                             noise_csr = sp.csr_matrix(
                                 (noise_data, (noise_rows, noise_cols)),
                                 shape=(batch_size, total_genes),
@@ -666,9 +666,7 @@ def stream_denoised_to_cellranger_h5(
 
                 # Accumulate denoised totals per output barcode.
                 row_sums = np.asarray(denoised_batch.sum(axis=1)).ravel()
-                denoised_per_barcode[batch_start:batch_end] = row_sums.astype(
-                    np.int64
-                )
+                denoised_per_barcode[batch_start:batch_end] = row_sums.astype(np.int64)
 
                 # Batch write — one EArray.append call for the whole batch.
                 writer.append_batch(denoised_batch)
@@ -682,9 +680,7 @@ def stream_denoised_to_cellranger_h5(
     return denoised_per_barcode
 
 
-def _split_latents(
-    latents: Dict[str, np.ndarray]
-) -> tuple[Dict[str, np.ndarray], Dict[str, list]]:
+def _split_latents(latents: Dict[str, np.ndarray]) -> tuple[Dict[str, np.ndarray], Dict[str, list]]:
     """Split latents into per-barcode arrays and global (scalar/small) entries.
 
     Returns:
@@ -722,6 +718,7 @@ def write_posterior_latents_csv(path: Path, latents: Dict[str, np.ndarray]) -> N
     must be written separately via :func:`write_posterior_global_latents_json`.
     """
     import pandas as pd
+
     per_barcode, _global = _split_latents(latents)
 
     data: Dict[str, np.ndarray] = {}
@@ -730,10 +727,10 @@ def write_posterior_latents_csv(path: Path, latents: Dict[str, np.ndarray]) -> N
             data[key] = arr
         elif arr.ndim == 2:
             for i in range(arr.shape[1]):
-                data[f'{key}_{i}'] = arr[:, i]
+                data[f"{key}_{i}"] = arr[:, i]
         else:
             logger.warning(f"Skipping latent '{key}' with shape {arr.shape}: only 1D/2D supported")
-    pd.DataFrame(data).to_csv(str(path), index=False, compression='gzip', float_format='%.17g')
+    pd.DataFrame(data).to_csv(str(path), index=False, compression="gzip", float_format="%.17g")
 
 
 def write_posterior_global_latents_json(path: Path, latents: Dict[str, np.ndarray]) -> None:
@@ -742,11 +739,10 @@ def write_posterior_global_latents_json(path: Path, latents: Dict[str, np.ndarra
     This captures entries such as *phi_loc_scale* = [phi_loc, phi_scale] that
     are model-wide rather than per-barcode.
     """
-    import json
     _per_barcode, global_lats = _split_latents(latents)
     if not global_lats:
         return
-    with open(str(path), 'w') as f:
+    with open(str(path), "w") as f:
         json.dump(global_lats, f)
 
 
@@ -755,7 +751,6 @@ def load_posterior_global_latents_json(path: Path) -> Dict[str, np.ndarray]:
 
     Returns an empty dict if the file does not exist.
     """
-    import json
     if not path.exists():
         return {}
     with open(str(path)) as f:
@@ -766,33 +761,33 @@ def load_posterior_global_latents_json(path: Path) -> Dict[str, np.ndarray]:
 def load_posterior_latents_csv(path: Path) -> Dict[str, np.ndarray]:
     """Load posterior MAP latents from a gzip-compressed CSV file."""
     import pandas as pd
-    df = pd.read_csv(str(path), compression='gzip')
+
+    df = pd.read_csv(str(path), compression="gzip")
     latents: Dict[str, np.ndarray] = {}
     z_cols = sorted(
-        [c for c in df.columns if c.startswith('z_') and c.split('_', 1)[1].isdigit()],
-        key=lambda x: int(x.split('_', 1)[1]),
+        [c for c in df.columns if c.startswith("z_") and c.split("_", 1)[1].isdigit()],
+        key=lambda x: int(x.split("_", 1)[1]),
     )
     other_cols = [c for c in df.columns if c not in z_cols]
     for col in other_cols:
         latents[col] = df[col].values
     if z_cols:
-        latents['z'] = df[z_cols].values
+        latents["z"] = df[z_cols].values
     return latents
 
 
 def unravel_dict(pref: str, d: Any) -> Dict:
     """Unravel a nested dict, returning a dict with values that are not dicts"""
 
-    if type(d) != dict:
+    if not isinstance(d, dict):
         return {pref: d}
     out_d = {}
     for k, v in d.items():
-        out_d.update({pref + '_' + key: val for key, val in unravel_dict(k, v).items()})
+        out_d.update({pref + "_" + key: val for key, val in unravel_dict(k, v).items()})
     return out_d
 
 
-def load_data(input_file: str)\
-        -> Dict[str, Union[sp.csr_matrix, List[np.ndarray], np.ndarray]]:
+def load_data(input_file: str) -> Dict[str, Union[sp.csr_matrix, List[np.ndarray], np.ndarray]]:
     """Load a dataset into the SingleCellRNACountsDataset object from
     the self.input_file"""
 
@@ -810,8 +805,7 @@ def choose_data_loader(input_file: str) -> Callable:
     """Detect the type of input data and return the relevant load function."""
 
     # Error if no input data file has been specified.
-    assert input_file is not None, \
-        'Attempting to load data, but no input file was specified.'
+    assert input_file is not None, "Attempting to load data, but no input file was specified."
 
     file_ext = os.path.splitext(input_file)[1]
 
@@ -819,34 +813,37 @@ def choose_data_loader(input_file: str) -> Callable:
     if os.path.isdir(input_file):
         return get_matrix_from_cellranger_mtx
 
-    elif file_ext == '.h5':
+    elif file_ext == ".h5":
         return get_matrix_from_cellranger_h5
 
-    elif input_file.endswith('.txt.gz') or input_file.endswith('.txt'):
+    elif input_file.endswith(".txt.gz") or input_file.endswith(".txt"):
         return get_matrix_from_dropseq_dge
 
-    elif input_file.endswith('.csv.gz') or input_file.endswith('.csv'):
+    elif input_file.endswith(".csv.gz") or input_file.endswith(".csv"):
         return get_matrix_from_bd_rhapsody
 
-    elif file_ext == '.h5ad':
+    elif file_ext == ".h5ad":
         return get_matrix_from_anndata
 
-    elif file_ext == '.loom':
+    elif file_ext == ".loom":
         return get_matrix_from_loom
 
-    elif file_ext == '.npz':
+    elif file_ext == ".npz":
         return get_matrix_from_npz
 
     else:
-        raise ValueError('Failed to determine input file type for '
-                         + input_file + '\n'
-                         + 'This must either be: a directory that contains '
-                           'CellRanger-format MTX outputs; a single CellRanger '
-                           '".h5" file; a DropSeq-format DGE ".txt.gz" file; '
-                           'a BD-Rhapsody-format ".csv" file; a ".h5ad" file '
-                           'produced by anndata (include all barcodes); a '
-                           '".loom" file (include all barcodes); or a ".npz" '
-                           'sparse matrix file')
+        raise ValueError(
+            "Failed to determine input file type for "
+            + input_file
+            + "\n"
+            + "This must either be: a directory that contains "
+            "CellRanger-format MTX outputs; a single CellRanger "
+            '".h5" file; a DropSeq-format DGE ".txt.gz" file; '
+            'a BD-Rhapsody-format ".csv" file; a ".h5ad" file '
+            "produced by anndata (include all barcodes); a "
+            '".loom" file (include all barcodes); or a ".npz" '
+            "sparse matrix file"
+        )
 
 
 def detect_cellranger_version_mtx(filedir: str) -> int:
@@ -863,7 +860,7 @@ def detect_cellranger_version_mtx(filedir: str) -> int:
 
     assert os.path.isdir(filedir), f"The directory {filedir} is not accessible."
 
-    if os.path.isfile(os.path.join(filedir, 'features.tsv.gz')):
+    if os.path.isfile(os.path.join(filedir, "features.tsv.gz")):
         return 3
 
     else:
@@ -882,8 +879,7 @@ def detect_cellranger_version_h5(filename: str) -> int:
 
     """
 
-    with tables.open_file(filename, 'r') as f:
-
+    with tables.open_file(filename, "r") as f:
         # For CellRanger v2, each group in the table (other than root)
         # contains a genome.
         # For CellRanger v3, there is a 'matrix' group that contains 'features'.
@@ -891,9 +887,8 @@ def detect_cellranger_version_h5(filename: str) -> int:
         version = 2
 
         try:
-
             # This works for version 3 but not for version 2.
-            getattr(f.root.matrix, 'features')
+            getattr(f.root.matrix, "features")
             version = 3
 
         except tables.NoSuchNodeError:
@@ -902,8 +897,7 @@ def detect_cellranger_version_h5(filename: str) -> int:
     return version
 
 
-def get_matrix_from_cellranger_mtx(filedir: str) \
-        -> Dict[str, Union[sp.csr_matrix, List[np.ndarray], np.ndarray]]:
+def get_matrix_from_cellranger_mtx(filedir: str) -> Dict[str, Union[sp.csr_matrix, List[np.ndarray], np.ndarray]]:
     """Load a count matrix from an mtx directory from CellRanger's output.
 
     For CellRanger v2:
@@ -956,16 +950,12 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
 
     # CellRanger version 3
     if cellranger_version == 3:
-
-        matrix_file = os.path.join(filedir, 'matrix.mtx.gz')
-        gene_file = os.path.join(filedir, 'features.tsv.gz')
-        barcode_file = os.path.join(filedir, 'barcodes.tsv.gz')
+        matrix_file = os.path.join(filedir, "matrix.mtx.gz")
+        gene_file = os.path.join(filedir, "features.tsv.gz")
+        barcode_file = os.path.join(filedir, "barcodes.tsv.gz")
 
         # Read in feature names.
-        features = np.genfromtxt(fname=gene_file,
-                                 delimiter="\t",
-                                 skip_header=0,
-                                 dtype=str)
+        features = np.genfromtxt(fname=gene_file, delimiter="\t", skip_header=0, dtype=str)
 
         # Read in gene expression and feature data.
         gene_ids = features[:, 0].squeeze()  # first column
@@ -974,17 +964,13 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
 
     # CellRanger version 2
     elif cellranger_version == 2:
-
         # Read in the count matrix using scipy.
-        matrix_file = os.path.join(filedir, 'matrix.mtx')
-        gene_file = os.path.join(filedir, 'genes.tsv')
-        barcode_file = os.path.join(filedir, 'barcodes.tsv')
+        matrix_file = os.path.join(filedir, "matrix.mtx")
+        gene_file = os.path.join(filedir, "genes.tsv")
+        barcode_file = os.path.join(filedir, "barcodes.tsv")
 
         # Read in gene names.
-        gene_data = np.genfromtxt(fname=gene_file,
-                                  delimiter="\t",
-                                  skip_header=0,
-                                  dtype=str)
+        gene_data = np.genfromtxt(fname=gene_file, delimiter="\t", skip_header=0, dtype=str)
         if len(gene_data.shape) == 1:  # custom file format with just gene names
             gene_names = gene_data.squeeze()
             gene_ids = None
@@ -994,8 +980,9 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
         feature_types = None
 
     else:
-        raise NotImplementedError('MTX format was not identifiable as CellRanger '
-                                  'v2 or v3.  Please check 10x Genomics formatting.')
+        raise NotImplementedError(
+            "MTX format was not identifiable as CellRanger v2 or v3.  Please check 10x Genomics formatting."
+        )
 
     # For both versions:
 
@@ -1003,32 +990,30 @@ def get_matrix_from_cellranger_mtx(filedir: str) \
     count_matrix = io.mmread(matrix_file).tocsr().transpose()
 
     # Read in barcode names.
-    barcodes = np.genfromtxt(fname=barcode_file,
-                             delimiter="\t",
-                             skip_header=0,
-                             dtype=str)
+    barcodes = np.genfromtxt(fname=barcode_file, delimiter="\t", skip_header=0, dtype=str)
 
     # Issue warnings if necessary, based on dimensions matching.
     if count_matrix.shape[1] != len(gene_names):
-        logger.warning(f"Number of gene names in {filedir}/genes.tsv "
-                       f"does not match the number expected from the "
-                       f"count matrix.")
+        logger.warning(
+            f"Number of gene names in {filedir}/genes.tsv does not match the number expected from the count matrix."
+        )
     if count_matrix.shape[0] != len(barcodes):
-        logger.warning(f"Number of barcodes in {filedir}/barcodes.tsv "
-                       f"does not match the number expected from the "
-                       f"count matrix.")
+        logger.warning(
+            f"Number of barcodes in {filedir}/barcodes.tsv does not match the number expected from the count matrix."
+        )
 
-    return {'matrix': count_matrix,
-            'gene_names': gene_names,
-            'feature_types': feature_types,
-            'gene_ids': gene_ids,
-            'genomes': None,
-            'barcodes': barcodes,
-            'cellranger_version': cellranger_version}
+    return {
+        "matrix": count_matrix,
+        "gene_names": gene_names,
+        "feature_types": feature_types,
+        "gene_ids": gene_ids,
+        "genomes": None,
+        "barcodes": barcodes,
+        "cellranger_version": cellranger_version,
+    }
 
 
-def get_matrix_from_cellranger_h5(filename: str) \
-        -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
+def get_matrix_from_cellranger_h5(filename: str) -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
     """Load a count matrix from an h5 file from CellRanger's output.
 
     The file needs to be a _raw_gene_bc_matrices_h5.h5 file.  This function
@@ -1068,7 +1053,7 @@ def get_matrix_from_cellranger_h5(filename: str) \
     cellranger_version = detect_cellranger_version_h5(filename=filename)
     logger.info(f"CellRanger v{cellranger_version} format")
 
-    with tables.open_file(filename, 'r') as f:
+    with tables.open_file(filename, "r") as f:
         # Initialize empty lists.
         csc_list = []
         barcodes: np.ndarray | None = None
@@ -1081,7 +1066,6 @@ def get_matrix_from_cellranger_h5(filename: str) \
         # Each group in the table (other than root) contains a genome,
         # so walk through the groups to get data for each genome.
         if cellranger_version == 2:
-
             feature_names_list: list = []
             feature_ids_list: list = []
             genomes_list: list = []
@@ -1090,16 +1074,15 @@ def get_matrix_from_cellranger_h5(filename: str) \
                 try:
                     # Read in data for this genome, and put it into a
                     # scipy.sparse.csc.csc_matrix
-                    barcodes = getattr(group, 'barcodes').read()
-                    data = getattr(group, 'data').read()
-                    indices = getattr(group, 'indices').read()
-                    indptr = getattr(group, 'indptr').read()
-                    shape = getattr(group, 'shape').read()
-                    csc_list.append(sp.csc_matrix((data, indices, indptr),
-                                                  shape=shape))
-                    fnames_this_genome = getattr(group, 'gene_names').read()
+                    barcodes = getattr(group, "barcodes").read()
+                    data = getattr(group, "data").read()
+                    indices = getattr(group, "indices").read()
+                    indptr = getattr(group, "indptr").read()
+                    shape = getattr(group, "shape").read()
+                    csc_list.append(sp.csc_matrix((data, indices, indptr), shape=shape))
+                    fnames_this_genome = getattr(group, "gene_names").read()
                     feature_names_list.extend(fnames_this_genome)
-                    feature_ids_list.extend(getattr(group, 'genes').read())
+                    feature_ids_list.extend(getattr(group, "genes").read())
                     genomes_list.extend([group._g_gettitle()] * fnames_this_genome.size)
 
                 except tables.NoSuchNodeError:
@@ -1117,64 +1100,67 @@ def get_matrix_from_cellranger_h5(filename: str) \
         # CellRanger v3:
         # There is only the 'matrix' group.
         elif cellranger_version == 3:
-
             # Read in data for this genome, and put it into a
             # scipy.sparse.csc.csc_matrix
-            barcodes = getattr(f.root.matrix, 'barcodes').read()
-            data = getattr(f.root.matrix, 'data').read()
-            indices = getattr(f.root.matrix, 'indices').read()
-            indptr = getattr(f.root.matrix, 'indptr').read()
-            shape = getattr(f.root.matrix, 'shape').read()
-            csc_list.append(sp.csc_matrix((data, indices, indptr),
-                                          shape=shape))
+            barcodes = getattr(f.root.matrix, "barcodes").read()
+            data = getattr(f.root.matrix, "data").read()
+            indices = getattr(f.root.matrix, "indices").read()
+            indptr = getattr(f.root.matrix, "indptr").read()
+            shape = getattr(f.root.matrix, "shape").read()
+            csc_list.append(sp.csc_matrix((data, indices, indptr), shape=shape))
 
             # Read in 'feature' information
-            feature_group = f.get_node(f.root.matrix, 'features')
-            feature_names = getattr(feature_group, 'name').read()
+            feature_group = f.get_node(f.root.matrix, "features")
+            feature_names = getattr(feature_group, "name").read()
 
             try:
-                feature_types = getattr(feature_group, 'feature_type').read()
+                feature_types = getattr(feature_group, "feature_type").read()
             except tables.NoSuchNodeError:
                 # This exists in case someone produced a file without feature_type.
                 pass
             try:
-                feature_ids = getattr(feature_group, 'id').read()
+                feature_ids = getattr(feature_group, "id").read()
             except tables.NoSuchNodeError:
                 # This exists in case someone produced a file without feature id.
                 pass
             try:
-                genomes = getattr(feature_group, 'genome').read()
+                genomes = getattr(feature_group, "genome").read()
             except tables.NoSuchNodeError:
                 # This exists in case someone produced a file without feature genome.
                 pass
 
     # Put the data together (possibly from several genomes for v2 datasets).
-    count_matrix = sp.vstack(csc_list, format='csc')
+    count_matrix = sp.vstack(csc_list, format="csc")
     count_matrix = count_matrix.transpose().tocsr()
 
     assert barcodes is not None, "barcodes not loaded from HDF5 file"
 
     # Issue warnings if necessary, based on dimensions matching.
     if count_matrix.shape[1] != feature_names.size:
-        logger.warning(f"Number of gene names ({feature_names.size}) in {filename} "
-                       f"does not match the number expected from the count "
-                       f"matrix ({count_matrix.shape[1]}).")
+        logger.warning(
+            f"Number of gene names ({feature_names.size}) in {filename} "
+            f"does not match the number expected from the count "
+            f"matrix ({count_matrix.shape[1]})."
+        )
     if count_matrix.shape[0] != barcodes.size:
-        logger.warning(f"Number of barcodes ({barcodes.size}) in {filename} "
-                       f"does not match the number expected from the count "
-                       f"matrix ({count_matrix.shape[0]}).")
+        logger.warning(
+            f"Number of barcodes ({barcodes.size}) in {filename} "
+            f"does not match the number expected from the count "
+            f"matrix ({count_matrix.shape[0]})."
+        )
 
-    return {'matrix': count_matrix,
-            'gene_names': feature_names,
-            'gene_ids': feature_ids,
-            'genomes': genomes,
-            'feature_types': feature_types,
-            'barcodes': barcodes,
-            'cellranger_version': cellranger_version}
+    return {
+        "matrix": count_matrix,
+        "gene_names": feature_names,
+        "gene_ids": feature_ids,
+        "genomes": genomes,
+        "feature_types": feature_types,
+        "barcodes": barcodes,
+        "cellranger_version": cellranger_version,
+    }
 
 
-def get_matrix_from_dropseq_dge(filename: str) \
-        -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
+def get_matrix_from_dropseq_dge(filename: str) -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
     """Load a count matrix from a DropSeq DGE matrix file.
 
     The file needs to be a gzipped text file in DGE format.  This function
@@ -1205,21 +1191,20 @@ def get_matrix_from_dropseq_dge(filename: str) \
 
     """
 
-    logger.info(f"DropSeq DGE format")
+    logger.info("DropSeq DGE format")
 
-    load_fcn = gzip.open if filename.endswith('.gz') else open
+    load_fcn = gzip.open if filename.endswith(".gz") else open
 
-    with load_fcn(filename, 'rt') as f:
-
+    with load_fcn(filename, "rt") as f:
         # Skip the comment '#' lines in header
         for header in f:
-            if header[0] == '#':
+            if header[0] == "#":
                 continue
             else:
                 break
 
         # Read in first row with droplet barcodes
-        barcodes = header.split('\n')[0].split('\t')[1:]
+        barcodes = header.split("\n")[0].split("\t")[1:]
 
         # Gene names are first entry per row
         gene_names = []
@@ -1232,7 +1217,7 @@ def get_matrix_from_dropseq_dge(filename: str) \
         # Read in rest of file row by row
         for i, line in enumerate(f):
             # Parse row into gene name and count data
-            parsed_line = line.split('\n')[0].split('\t')
+            parsed_line = line.split("\n")[0].split("\t")
             gene_names.append(parsed_line[0])
             counts = np.array(parsed_line[1:], dtype=int)
 
@@ -1242,20 +1227,19 @@ def get_matrix_from_dropseq_dge(filename: str) \
             col.extend(nonzero_col_inds)
             data.extend(counts[nonzero_col_inds])
 
-    count_matrix = sp.csc_matrix((data, (row, col)),
-                                 shape=(len(gene_names), len(barcodes)),
-                                 dtype=float).transpose()
+    count_matrix = sp.csc_matrix((data, (row, col)), shape=(len(gene_names), len(barcodes)), dtype=float).transpose()
 
-    return {'matrix': count_matrix,
-            'gene_names': np.array(gene_names),
-            'gene_ids': None,
-            'genomes': None,
-            'feature_types': None,
-            'barcodes': np.array(barcodes)}
+    return {
+        "matrix": count_matrix,
+        "gene_names": np.array(gene_names),
+        "gene_ids": None,
+        "genomes": None,
+        "feature_types": None,
+        "barcodes": np.array(barcodes),
+    }
 
 
-def get_matrix_from_bd_rhapsody(filename: str) \
-        -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
+def get_matrix_from_bd_rhapsody(filename: str) -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
     """Load a count matrix from a BD Rhapsody MolsPerCell.csv file.
 
     The file needs to be in MolsPerCell_Unfiltered format, which is comma
@@ -1287,21 +1271,20 @@ def get_matrix_from_bd_rhapsody(filename: str) \
 
     """
 
-    logger.info(f"BD Rhapsody MolsPerCell_Unfiltered.csv format")
+    logger.info("BD Rhapsody MolsPerCell_Unfiltered.csv format")
 
-    load_fcn = gzip.open if filename.endswith('.gz') else open
+    load_fcn = gzip.open if filename.endswith(".gz") else open
 
-    with load_fcn(filename, 'rt') as f:
-
+    with load_fcn(filename, "rt") as f:
         # Skip the comment '#' lines in header
         for header in f:
-            if header[0] == '#':
+            if header[0] == "#":
                 continue
             else:
                 break
 
         # Read in first row with gene names
-        gene_names = header.split('\n')[0].split(',')[1:]
+        gene_names = header.split("\n")[0].split(",")[1:]
 
         # Barcode names are first entry per row
         barcodes = []
@@ -1314,7 +1297,7 @@ def get_matrix_from_bd_rhapsody(filename: str) \
         # Read in rest of file row by row
         for i, line in enumerate(f):
             # Parse row into gene name and count data
-            parsed_line = line.split('\n')[0].split(',')
+            parsed_line = line.split("\n")[0].split(",")
             barcodes.append(parsed_line[0])
             counts = np.array(parsed_line[1:], dtype=np.int_)
 
@@ -1324,20 +1307,19 @@ def get_matrix_from_bd_rhapsody(filename: str) \
             col.extend(nonzero_col_inds)
             data.extend(counts[nonzero_col_inds])
 
-    count_matrix = sp.csc_matrix((data, (row, col)),
-                                 shape=(len(barcodes), len(gene_names)),
-                                 dtype=float)
+    count_matrix = sp.csc_matrix((data, (row, col)), shape=(len(barcodes), len(gene_names)), dtype=float)
 
-    return {'matrix': count_matrix,
-            'gene_names': np.array(gene_names),
-            'gene_ids': None,
-            'genomes': None,
-            'feature_types': None,
-            'barcodes': np.array(barcodes)}
+    return {
+        "matrix": count_matrix,
+        "gene_names": np.array(gene_names),
+        "gene_ids": None,
+        "genomes": None,
+        "feature_types": None,
+        "barcodes": np.array(barcodes),
+    }
 
 
-def get_matrix_from_npz(filename: str) \
-        -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
+def get_matrix_from_npz(filename: str) -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
     """Load a count matrix from a sparse NPZ file, accompanied by barcode and
     gene NPY files.
     NOTE: This format is one output of the Optimus pipeline. It loads much
@@ -1367,29 +1349,32 @@ def get_matrix_from_npz(filename: str) \
              antibody capture reads), which also correspond to the columns
              in the out['matrix'].
     """
-    logger.info(f"Optimus sparse NPZ format")
+    logger.info("Optimus sparse NPZ format")
     try:
         count_matrix = sp.load_npz(file=filename)
         file_dir, _ = os.path.split(filename)
-        gene_ids = np.load(os.path.join(file_dir, 'col_index.npy'))
-        barcodes = np.load(os.path.join(file_dir, 'row_index.npy'))
+        gene_ids = np.load(os.path.join(file_dir, "col_index.npy"))
+        barcodes = np.load(os.path.join(file_dir, "row_index.npy"))
     except IOError as e:
-        logger.error('Loading an NPZ file requires two additional files in the '
-                     f'same directory ({file_dir}): '
-                     'one called "col_index.npy" that contains genes, and one '
-                     'called "row_index.npy" that contains barcodes.')
+        logger.error(
+            "Loading an NPZ file requires two additional files in the "
+            f"same directory ({file_dir}): "
+            'one called "col_index.npy" that contains genes, and one '
+            'called "row_index.npy" that contains barcodes.'
+        )
         logger.error(traceback.format_exc())
         raise e
-    return {'matrix': count_matrix,
-            'gene_names': gene_ids,  # that's all we have access to, so we'll use it
-            'gene_ids': gene_ids,
-            'genomes': None,
-            'feature_types': None,
-            'barcodes': barcodes}
+    return {
+        "matrix": count_matrix,
+        "gene_names": gene_ids,  # that's all we have access to, so we'll use it
+        "gene_ids": gene_ids,
+        "genomes": None,
+        "feature_types": None,
+        "barcodes": barcodes,
+    }
 
 
-def get_matrix_from_anndata(filename: str) \
-        -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
+def get_matrix_from_anndata(filename: str) -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
     """Load a count matrix from an h5ad AnnData file.
     The file needs to contain raw counts for all measured barcodes in the
     `.X` attribute or a `.layer[{'counts', 'spliced'}]` attribute.  This function
@@ -1421,19 +1406,17 @@ def get_matrix_from_anndata(filename: str) \
              antibody capture reads), which also correspond to the columns
              in the out['matrix'].
     """
-    logger.info(f"AnnData format")
+    logger.info("AnnData format")
     try:
         adata = anndata.read_h5ad(filename)
     except anndata._io.utils.AnnDataReadError as e:
-        logger.error(f'A call to anndata.read_h5ad() with anndata {anndata.__version__} '
-                     f'threw AnnDataReadError: ')
+        logger.error(f"A call to anndata.read_h5ad() with anndata {anndata.__version__} threw AnnDataReadError: ")
         logger.error(traceback.format_exc())
         raise e
     return _dict_from_anndata(adata)
 
 
-def get_matrix_from_loom(filename: str) \
-        -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
+def get_matrix_from_loom(filename: str) -> Dict[str, Union[sp.csr_matrix, np.ndarray]]:
     """Load a count matrix from a loom file.
     The file needs to contain raw counts for all measured barcodes in the
     layer '', as in
@@ -1466,12 +1449,11 @@ def get_matrix_from_loom(filename: str) \
              antibody capture reads), which also correspond to the columns
              in the out['matrix'].
     """
-    logger.info(f"Loom format, expecting Optimus pipeline conventions")
+    logger.info("Loom format, expecting Optimus pipeline conventions")
     try:
-        adata = anndata.read_loom(filename, sparse=True, X_name='')
+        adata = anndata.read_loom(filename, sparse=True, X_name="")
     except anndata._io.utils.AnnDataReadError as e:
-        logger.error(f'A call to anndata.read_loom() with anndata {anndata.__version__} '
-                     f'threw AnnDataReadError: ')
+        logger.error(f"A call to anndata.read_loom() with anndata {anndata.__version__} threw AnnDataReadError: ")
         logger.error(traceback.format_exc())
         raise e
     return _dict_from_anndata(adata)
@@ -1525,9 +1507,11 @@ def _dict_from_anndata(adata: anndata.AnnData) -> Dict[str, Union[sp.csr_matrix,
     # consistent with a raw single cell experiment
     if count_matrix.shape[0] < consts.MINIMUM_BARCODES_H5AD:
         # this experiment might be prefiltered
-        logger.warning(f"Only {count_matrix.shape[0]} barcodes were found.\n"
-                       "This suggests the matrix was prefiltered.\n"
-                       "CellBender requires a raw, unfiltered [Barcodes, Genes] matrix.")
+        logger.warning(
+            f"Only {count_matrix.shape[0]} barcodes were found.\n"
+            "This suggests the matrix was prefiltered.\n"
+            "CellBender requires a raw, unfiltered [Barcodes, Genes] matrix."
+        )
 
     # AnnData is [Cells, Genes], no need to transpose
     # we typecast explicitly in the off chance `count_matrix` was dense.
@@ -1539,35 +1523,41 @@ def _dict_from_anndata(adata: anndata.AnnData) -> Dict[str, Union[sp.csr_matrix,
 
     # Make an attempt to find feature_IDs if they are present.
     feature_ids = None
-    for key in ['gene_id', 'gene_ids', 'ensembl_ids']:
+    for key in ["gene_id", "gene_ids", "ensembl_ids"]:
         if key in adata.var.keys():
             feature_ids = np.array(adata.var[key].values, dtype=str)
 
     # Make an attempt to find feature_types if they are present.
     feature_types = None
-    for key in ['feature_type', 'feature_types']:
+    for key in ["feature_type", "feature_types"]:
         if key in adata.var.keys():
             feature_types = np.array(adata.var[key].values, dtype=str)
 
     # Make an attempt to find genomes if they are present.
     genomes = None
-    for key in ['genome', 'genomes']:
+    for key in ["genome", "genomes"]:
         if key in adata.var.keys():
             genomes = np.array(adata.var[key].values, dtype=str)
 
     # Issue warnings if necessary, based on dimensions matching.
     if count_matrix.shape[1] != feature_names.size:
-        logger.warning(f"Number of gene names ({feature_names.size}) "
-                       f"does not match the number expected from the count "
-                       f"matrix ({count_matrix.shape[1]}).")
+        logger.warning(
+            f"Number of gene names ({feature_names.size}) "
+            f"does not match the number expected from the count "
+            f"matrix ({count_matrix.shape[1]})."
+        )
     if count_matrix.shape[0] != barcodes.size:
-        logger.warning(f"Number of barcodes ({barcodes.size}) "
-                       f"does not match the number expected from the count "
-                       f"matrix ({count_matrix.shape[0]}).")
+        logger.warning(
+            f"Number of barcodes ({barcodes.size}) "
+            f"does not match the number expected from the count "
+            f"matrix ({count_matrix.shape[0]})."
+        )
 
-    return {'matrix': count_matrix,
-            'gene_names': feature_names,
-            'gene_ids': feature_ids,
-            'genomes': genomes,
-            'feature_types': feature_types,
-            'barcodes': barcodes}
+    return {
+        "matrix": count_matrix,
+        "gene_names": feature_names,
+        "gene_ids": feature_ids,
+        "genomes": genomes,
+        "feature_types": feature_types,
+        "barcodes": barcodes,
+    }
