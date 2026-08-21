@@ -25,7 +25,7 @@ import torch
 import cellbender.remove_background.consts as consts
 from cellbender.monitor import get_hardware_usage
 from cellbender.remove_background.checkpoint import load_checkpoint, load_from_checkpoint, make_tarball, unpack_tarball
-from cellbender.remove_background.data.dataprep import DataLoader
+from cellbender.remove_background.data.dataprep import make_simple_dataloader
 from cellbender.remove_background.data.dataset import get_dataset_obj
 from cellbender.remove_background.data.io import (
     POSTERIOR_SCHEMA,
@@ -401,13 +401,11 @@ class Posterior:
             raise RuntimeError("Zero cells found!")
 
         dataloader_index_to_analyzed_bc_index = torch.where(torch.tensor(cell_logic))[0]
-        cell_data_loader = DataLoader(
-            count_matrix[cell_logic],
-            empty_drop_dataset=None,
+        cell_data_loader = make_simple_dataloader(
+            matrix=count_matrix[cell_logic],
             batch_size=self.posterior_batch_size,
-            fraction_empties=0.0,
-            shuffle=False,
             use_cuda=self.use_cuda,
+            shuffle=False,
         )
 
         ind = 0

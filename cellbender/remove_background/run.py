@@ -28,7 +28,7 @@ from cellbender.remove_background.checkpoint import (
     load_optim_from_bytes,
     save_checkpoint,
 )
-from cellbender.remove_background.data.dataprep import DataLoader
+from cellbender.remove_background.data.dataprep import DataLoader, reconstruct_loader
 from cellbender.remove_background.data.dataprep import prep_sparse_data_for_training as prep_data_for_training
 from cellbender.remove_background.data.dataset import SingleCellRNACountsDataset, get_dataset_obj
 from cellbender.remove_background.estimation import MAP, Mean, MultipleChoiceKnapsack, SingleSample, ThresholdCDF
@@ -778,42 +778,6 @@ def _build_model(
     )
 
 
-def _reconstruct_loader(
-    state: Dict,
-    count_matrix: sp.csr_matrix,
-    empty_matrix: sp.csr_matrix,
-    use_cuda: bool,
-) -> DataLoader:
-    """Reconstruct a DataLoader from a compact npz state dict previously saved
-    by :meth:`DataLoader.get_state`.
-
-    The DataLoader is constructed with ``shuffle=False`` so that :meth:`__init__`
-    does not consume a numpy random draw before :meth:`set_state` restores the
-    saved index list and pointer.  The ``shuffle`` attribute is then set to the
-    saved value so subsequent epochs shuffle correctly.
-    """
-    cell_inds = state["original_cell_indices"]
-    empty_inds = state["original_empty_indices"]
-    loader = DataLoader(
-        dataset=count_matrix[cell_inds, :],
-        empty_drop_dataset=empty_matrix[empty_inds, :] if empty_inds.size > 0 else None,
-        batch_size=int(state["batch_size"]),
-        fraction_empties=float(state["fraction_empties"]),
-        shuffle=False,  # avoid numpy draw in __init__; restored after set_state
-        use_cuda=use_cuda,
-        original_cell_indices=cell_inds,
-        original_empty_indices=empty_inds,
-    )
-    loader.shuffle = bool(state["shuffle"])
-    loader.set_state(ind_list=state["ind_list"], ptr=int(state["ptr"]))
-    # Restore the cached length so that the first call to len(loader) inside
-    # get_optimizer() does not re-iterate the loader (which would consume the
-    # saved ind_list and make an extra numpy draw).
-    if "_length" in state:
-        loader._length = int(state["_length"])
-    return loader
-
-
 def run_inference(
     dataset_obj: SingleCellRNACountsDataset,
     args: argparse.Namespace,
@@ -862,6 +826,14 @@ def run_inference(
     # Always load the count matrix — needed for both fresh start and ckpt reconstruction.
     count_matrix = dataset_obj.get_count_matrix()
     empty_matrix = dataset_obj.get_count_matrix_empties()
+
+    # Backed mode: mmap files live next to the output file so they survive between runs.
+    mmap_cache_dir = None
+    if getattr(args, "backed_mode", False):
+        from pathlib import Path
+
+        mmap_cache_dir = Path(args.output_file).with_suffix("").parent / (Path(args.output_file).stem + "_mmap")
+        logger.info(f"Backed mode enabled: mmap cache at {mmap_cache_dir}")
 
     if ckpt_loaded:
         logger.info("Reconstructing model and dataloaders from checkpoint state...")
@@ -915,8 +887,22 @@ def run_inference(
             model.loss = ckpt["model_meta"]["loss"]
 
         # Phase 1: reconstruct dataloaders from compact index state.
-        train_loader = _reconstruct_loader(ckpt["train_loader_state"], count_matrix, empty_matrix, args.use_cuda)
-        test_loader = _reconstruct_loader(ckpt["test_loader_state"], count_matrix, empty_matrix, args.use_cuda)
+        train_loader = reconstruct_loader(
+            ckpt["train_loader_state"],
+            count_matrix,
+            empty_matrix,
+            args.use_cuda,
+            mmap_cache_dir,
+            getattr(args, "dataloader_workers", 0),
+        )
+        test_loader = reconstruct_loader(
+            ckpt["test_loader_state"],
+            count_matrix,
+            empty_matrix,
+            args.use_cuda,
+            mmap_cache_dir,
+            getattr(args, "dataloader_workers", 0),
+        )
 
         # Phase 3: rebuild optimizer from args + restore saved state.
         scheduler = get_optimizer(
@@ -952,6 +938,8 @@ def run_inference(
             fraction_empties=args.fraction_empties,
             shuffle=True,
             use_cuda=args.use_cuda,
+            mmap_cache_dir=mmap_cache_dir,
+            num_workers=getattr(args, "dataloader_workers", 0),
         )
 
         # Set up optimizer (optionally wrapped in a learning rate scheduler).

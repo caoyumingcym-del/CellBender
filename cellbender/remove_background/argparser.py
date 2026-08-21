@@ -364,6 +364,28 @@ def add_subparser_args(subparsers: argparse._SubParsersAction) -> argparse._SubP
         "Useful on shared cluster nodes where you want to cap CellBender's memory footprint.",
     )
     subparser.add_argument(
+        "--dataloader-workers",
+        type=int,
+        default=0,
+        dest="dataloader_workers",
+        help="Number of worker processes for the training DataLoader.  "
+        "0 (the default) loads data in the main process.  Increasing this "
+        "to 1 on a Linux machine may improve GPU utilisation at the cost of extra "
+        "memory and process-spawn overhead.  Values above 1 are slower on benchmarks.",
+    )
+    subparser.add_argument(
+        "--backed-mode",
+        dest="backed_mode",
+        action="store_true",
+        default=False,
+        help="Store the training count matrices as memory-mapped files on disk "
+        "instead of keeping them in RAM.  Useful when the dataset is large "
+        "enough that holding two copies of the count matrix (train and test "
+        "splits) in memory is problematic.  The mmap files are written once "
+        "next to the output file and reused on checkpoint resume.  Dataloader speed "
+        "will be slightly slower due to disk I/O (68%% speed on test data).",
+    )
+    subparser.add_argument(
         "--no-report",
         dest="no_report",
         action="store_true",

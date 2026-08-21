@@ -5,7 +5,7 @@ import scipy.sparse as sp
 import torch
 
 import cellbender.remove_background.consts as consts
-from cellbender.remove_background.data.dataprep import DataLoader
+from cellbender.remove_background.data.dataprep import DataLoader, make_simple_dataloader
 from cellbender.remove_background.data.io import load_data
 from cellbender.remove_background.data.priors import get_priors, \
     get_cell_count_given_expected_cells, \
@@ -14,7 +14,7 @@ from cellbender.remove_background.data.priors import get_priors, \
 from cellbender.remove_background.sparse_utils import csr_set_rows_to_zero, \
     overwrite_matrix_with_columns_from_another
 
-from typing import Any, Dict, List, Optional, Iterable, Callable
+from typing import Any, Dict, List, Optional, Iterable
 import logging
 import argparse
 
@@ -456,7 +456,6 @@ class SingleCellRNACountsDataset:
                        batch_size: int = 200,
                        shuffle: bool = False,
                        analyzed_bcs_only: bool = True,
-                       sort_by: Callable[[sp.csr_matrix], np.ndarray] | None = None,
                        ) -> DataLoader:
         """Return a dataloader for the count matrix.
 
@@ -466,10 +465,6 @@ class SingleCellRNACountsDataset:
             shuffle: Whether dataloader should shuffle the data.
             analyzed_bcs_only: Only include the barcodes that have been
                 analyzed, not the surely empty droplets.
-            sort_by: Lambda function which, when applied to the sparse matrix,
-                will return values that can be sorted to give a sort order to
-                the dataset. Dataloader will load data in order of increasing
-                values.
 
         Returns:
             data_loader: A dataloader that yields the entire dataset in batches.
@@ -481,16 +476,12 @@ class SingleCellRNACountsDataset:
         else:
             count_matrix = self.get_count_matrix_all_barcodes()
 
-        data_loader = DataLoader(
-            count_matrix,
-            empty_drop_dataset=None,
+        return make_simple_dataloader(
+            matrix=count_matrix,
             batch_size=batch_size,
-            fraction_empties=0.,
-            shuffle=shuffle,
-            sort_by=sort_by,
             use_cuda=use_cuda,
+            shuffle=shuffle,
         )
-        return data_loader
 
     def restore_eliminated_features_in_cells(
             self,

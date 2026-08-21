@@ -15,11 +15,18 @@ from cellbender.remove_background.downstream import anndata_from_h5
 
 
 @pytest.mark.parametrize(
+    "extra_args",
+    [
+        pytest.param([], id="default"),
+        pytest.param(["--backed-mode", "--dataloader-workers", "1"], id="backed-1worker"),
+    ],
+)
+@pytest.mark.parametrize(
     "cuda",
     [False, pytest.param(True, marks=pytest.mark.skipif(not USE_CUDA, reason="requires CUDA"))],
     ids=lambda b: "cuda" if b else "cpu",
 )
-def test_full_run(tmpdir_factory, h5_v3_file, cuda):
+def test_full_run(tmpdir_factory, h5_v3_file, cuda, extra_args):
     """Do a full run of the command line tool using a small simulated dataset"""
 
     tmp_dir = tmpdir_factory.mktemp("data")
@@ -37,7 +44,7 @@ def test_full_run(tmpdir_factory, h5_v3_file, cuda):
         str(filename),
         "--epochs",
         "5",
-    ]
+    ] + extra_args
     if cuda:
         input_args.append("--cuda")
     args = get_populated_argparser().parse_args(input_args[1:])

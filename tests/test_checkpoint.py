@@ -27,7 +27,8 @@ from cellbender.remove_background.checkpoint import (
     save_checkpoint_async,
     save_random_state,
 )
-from cellbender.remove_background.data.dataprep import DataLoader
+from cellbender.remove_background.data.backends import InMemoryBackend
+from cellbender.remove_background.data.dataprep import _make_loader, reconstruct_loader
 from cellbender.remove_background.data.dataset import SingleCellRNACountsDataset
 from cellbender.remove_background.data.extras.simulate import (
     generate_sample_dirichlet_dataset,
@@ -182,14 +183,15 @@ def test_save_and_load_random_state(tmpdir_factory, perturbed_random_state_dict,
 def new_train_loader(data: sp.csr_matrix, batch_size: int, shuffle: bool = True):
     """Wrap a sparse matrix in our DataLoader for checkpointing tests."""
     n = data.shape[0]
-    return DataLoader(
-        dataset=data,
-        empty_drop_dataset=None,
-        batch_size=batch_size,
-        fraction_empties=0.0,
+    return _make_loader(
+        cell_backend=InMemoryBackend(data),
+        empty_backend=None,
+        cell_batch_size=batch_size,
+        n_empty_per_batch=0,
+        generator=torch.Generator().manual_seed(0),
         shuffle=shuffle,
         use_cuda=False,
-        original_cell_indices=np.arange(n),
+        original_cell_indices=np.arange(n, dtype=np.int64),
         original_empty_indices=np.array([], dtype=np.int64),
     )
 
@@ -329,22 +331,14 @@ def test_save_and_load_pyro_checkpoint(tmpdir_factory, batch_size_n):
     scheduler_ckpt = optim.ClippedAdam({"lr": lr, "clip_norm": 10.0})
     load_optim_from_bytes(scheduler_ckpt, ckpt["optim_state_bytes"])
 
-    # Reconstruct dataloader.  Use shuffle=False during construction to avoid an
-    # extra numpy draw from _reset(); restore shuffle=True before set_state.
+    # Reconstruct dataloader from checkpoint state.
     loader_state = ckpt["train_loader_state"]
-    cell_inds = loader_state["original_cell_indices"]
-    train_loader_ckpt = DataLoader(
-        dataset=dataset_sparse[cell_inds, :],
-        empty_drop_dataset=None,
-        batch_size=int(loader_state["batch_size"]),
-        fraction_empties=float(loader_state["fraction_empties"]),
-        shuffle=False,  # avoid numpy draw in __init__; restored below
-        use_cuda=bool(loader_state["use_cuda"]),
-        original_cell_indices=cell_inds,
-        original_empty_indices=loader_state["original_empty_indices"],
+    train_loader_ckpt = reconstruct_loader(
+        state=loader_state,
+        count_matrix=dataset_sparse,
+        empty_matrix=sp.csr_matrix((0, dataset_sparse.shape[1]), dtype=np.float32),
+        use_cuda=False,
     )
-    train_loader_ckpt.shuffle = bool(loader_state["shuffle"])
-    train_loader_ckpt.set_state(ind_list=loader_state["ind_list"], ptr=int(loader_state["ptr"]))
 
     s = ckpt["loaded"]
 
@@ -383,12 +377,19 @@ def test_save_and_load_pyro_checkpoint(tmpdir_factory, batch_size_n):
 
 
 @pytest.mark.parametrize(
+    "extra_args",
+    [
+        pytest.param({}, id="default"),
+        pytest.param({"backed_mode": True, "dataloader_workers": 2}, id="backed-2workers"),
+    ],
+)
+@pytest.mark.parametrize(
     "cuda",
     [False, pytest.param(True, marks=pytest.mark.skipif(not USE_CUDA, reason="requires CUDA"))],
     ids=lambda b: "cuda" if b else "cpu",
 )
 @pytest.mark.parametrize("scheduler", [False, True], ids=lambda b: "OneCycleLR" if b else "Adam")
-def test_save_and_load_cellbender_checkpoint(tmpdir_factory, cuda, scheduler):
+def test_save_and_load_cellbender_checkpoint(tmpdir_factory, cuda, scheduler, extra_args):
     """Check that restarting from a checkpoint produces weights identical to
     uninterrupted one-shot training.
 
@@ -444,6 +445,9 @@ def test_save_and_load_cellbender_checkpoint(tmpdir_factory, cuda, scheduler):
     args.constant_learning_rate = not scheduler
     args.debug = False
     args.force_use_checkpoint = False
+
+    for k, v in extra_args.items():
+        setattr(args, k, v)
 
     # Compute the hashcode-based checkpoint filename once (excludes 'epochs').
     hashcode = create_workflow_hashcode(module_path=os.path.dirname(cellbender.__file__), args=args)[:10]
@@ -578,7 +582,7 @@ def test_compact_dataloader_state_roundtrip(tmpdir_factory):
 
     state = loader.get_state()
     assert "original_cell_indices" in state
-    assert "ind_list" in state
+    assert "perm" in state
     assert "ptr" in state
     assert "batch_size" in state
 
@@ -588,18 +592,12 @@ def test_compact_dataloader_state_roundtrip(tmpdir_factory):
     buf.seek(0)
     restored_state = dict(np.load(buf, allow_pickle=False))
 
-    cell_inds = restored_state["original_cell_indices"]
-    loader2 = DataLoader(
-        dataset=dataset_sparse[cell_inds, :],
-        empty_drop_dataset=None,
-        batch_size=int(restored_state["batch_size"]),
-        fraction_empties=float(restored_state["fraction_empties"]),
-        shuffle=bool(restored_state["shuffle"]),
-        use_cuda=bool(restored_state["use_cuda"]),
-        original_cell_indices=cell_inds,
-        original_empty_indices=restored_state["original_empty_indices"],
+    loader2 = reconstruct_loader(
+        state=restored_state,
+        count_matrix=dataset_sparse,
+        empty_matrix=sp.csr_matrix((0, dataset_sparse.shape[1]), dtype=np.float32),
+        use_cuda=False,
     )
-    loader2.set_state(ind_list=restored_state["ind_list"], ptr=int(restored_state["ptr"]))
 
     # Both loaders must yield the same first batch from here.
     batch1 = next(iter(loader))
