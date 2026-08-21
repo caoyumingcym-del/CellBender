@@ -21,6 +21,7 @@ from submit_benchmarks import (
     PROJECT,
     REGION,
     _build_preamble_lines,
+    _local_input_path,
     _machine_resources,
     make_job_id,
     submit_job,
@@ -69,9 +70,10 @@ def build_dev_job_script(
         "CKPT_SIDECAR_PID=$!",
     ]
 
+    local_input = _local_input_path(input_gcs)
     cmd_parts = [
         "cellbender remove-background",
-        "    --input /tmp/input.h5",
+        f"    --input {local_input}",
         f"    --output /tmp/{sample}_out.h5",
         "    --cuda",
     ]

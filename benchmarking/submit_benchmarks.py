@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -78,16 +79,23 @@ BENCHMARK_JOBS = [
 ]
 
 
+def _local_input_path(input_gcs: str) -> str:
+    """Return the /tmp local path for an input GCS file, preserving its extension."""
+    ext = os.path.splitext(input_gcs)[1]
+    return f"/tmp/input{ext}"
+
+
 def _build_preamble_lines(
     git_hash: str,
     input_gcs: str,
     truth_gcs: str | None = None,
 ) -> list[str]:
     """Shell lines shared by all job scripts: download inputs, install from source, verify CUDA."""
+    local_input = _local_input_path(input_gcs)
     lines = [
         "set -e",
         'export CLOUDSDK_PYTHON="$(which python3)"',
-        f"gsutil cp {input_gcs} /tmp/input.h5",
+        f"gsutil cp {input_gcs} {local_input}",
     ]
     if truth_gcs:
         lines.append(f"gsutil cp {truth_gcs} /tmp/truth.h5")
@@ -116,10 +124,11 @@ def build_job_script(
     truth_gcs: str | None,
 ) -> str:
     lines = _build_preamble_lines(git_hash, input_gcs, truth_gcs)
+    local_input = _local_input_path(input_gcs)
 
     cmd_parts = [
         "cellbender remove-background",
-        "    --input /tmp/input.h5",
+        f"    --input {local_input}",
         f"    --output /tmp/{sample}_out.h5",
         "    --cuda",
         "    --debug",
