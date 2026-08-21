@@ -674,7 +674,7 @@ class Posterior:
 
         """
 
-        logger.debug("Replaying model with guide to sample mu, alpha, lambda")
+        # logger.debug("Replaying model with guide to sample mu, alpha, lambda")
 
         assert self.vi_model is not None
         # Use pyro poutine to trace the guide and sample parameter values.
@@ -764,7 +764,7 @@ class Posterior:
         neg_inf_tensor = torch.ones_like(log_prob_tensor) * -np.inf
         log_prob_tensor = torch.where((noise_count_tensor <= data.unsqueeze(-1)), log_prob_tensor, neg_inf_tensor)
 
-        logger.debug(f"Prob computation with tensor of shape {log_prob_tensor.shape}")
+        # logger.debug(f"Prob computation with tensor of shape {log_prob_tensor.shape}")
 
         if debug:
             assert not torch.isnan(log_prob_tensor).any(), "log_prob_tensor contains a NaN"
