@@ -1054,6 +1054,15 @@ def get_matrix_from_cellranger_h5(filename: str) -> Dict[str, Union[sp.csr_matri
     logger.info(f"CellRanger v{cellranger_version} format")
 
     with tables.open_file(filename, "r") as f:
+        # Warn if the file looks like h5ad saved with a .h5 extension.
+        if hasattr(f.root, "obs") and hasattr(f.root, "var"):
+            logger.warning(
+                f"The file '{filename}' appears to be in AnnData (.h5ad) format, "
+                "but has a .h5 extension.  CellBender will attempt to read it as "
+                "CellRanger format, which will likely fail.  If this file is an "
+                "AnnData object, rename it with a .h5ad extension and re-run."
+            )
+
         # Initialize empty lists.
         csc_list = []
         barcodes: np.ndarray | None = None

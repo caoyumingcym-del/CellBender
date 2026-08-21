@@ -4,7 +4,9 @@ import gzip
 import shutil
 from typing import Dict, Generator, List, Optional, Tuple
 
+import anndata
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -16,6 +18,7 @@ from scipy.io import mmwrite
 from cellbender.remove_background.data.io import (
     detect_cellranger_version_h5,
     detect_cellranger_version_mtx,
+    get_matrix_from_anndata,
     get_matrix_from_cellranger_mtx,
     get_matrix_from_dropseq_dge,
     load_data,
@@ -193,9 +196,42 @@ def test_load_bd():
     pass
 
 
-@pytest.mark.skip
-def test_load_anndata():
-    pass
+@pytest.fixture(scope="session")
+def h5ad_file(tmpdir_factory, simulated_dataset):
+    """Write simulated_dataset as an h5ad file and return its path."""
+    tmp_dir = tmpdir_factory.mktemp("h5ad")
+    filename = str(tmp_dir.join("tmp.h5ad"))
+    d = simulated_dataset
+    adata = anndata.AnnData(
+        X=sp.csr_matrix(d["matrix"]),
+        obs=pd.DataFrame(index=d["barcodes"]),
+        var=pd.DataFrame(
+            {"gene_ids": d["gene_ids"], "feature_types": d["feature_types"]},
+            index=d["gene_names"],
+        ),
+    )
+    adata.write_h5ad(filename)
+    yield filename
+
+
+def test_load_anndata(simulated_dataset, h5ad_file):
+    d = simulated_dataset
+
+    # Direct loader.
+    loaded = get_matrix_from_anndata(h5ad_file)
+    assert_loaded_matches_saved(
+        d=d,
+        loaded=loaded,
+        keys=["barcodes", "gene_names", "gene_ids", "feature_types"],
+    )
+
+    # Auto-dispatch via load_data (exercises choose_data_loader for .h5ad extension).
+    loaded = load_data(h5ad_file)
+    assert_loaded_matches_saved(
+        d=d,
+        loaded=loaded,
+        keys=["barcodes", "gene_names", "gene_ids", "feature_types"],
+    )
 
 
 @pytest.mark.skip
