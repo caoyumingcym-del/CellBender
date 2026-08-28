@@ -161,6 +161,7 @@ def submit_job(
     gpu_type: str,
     cpu_count: int | None,
     memory_gb: int | None,
+    boot_disk_gib: int | None = None,
 ) -> batch_v1.Job:
     runnable = batch_v1.Runnable()
     runnable.container.image_uri = DOCKER_IMAGE
@@ -173,6 +174,8 @@ def submit_job(
         task_spec.compute_resource.cpu_milli = cpu_count * 1000
     if memory_gb:
         task_spec.compute_resource.memory_mib = memory_gb * 1024
+    if boot_disk_gib:
+        task_spec.compute_resource.boot_disk_mib = boot_disk_gib * 1024
 
     task_group = batch_v1.TaskGroup()
     task_group.task_count = 1
@@ -286,6 +289,12 @@ def main() -> None:
         default=None,
         help="Memory in GB per task. Auto-derived from --machine-type when not set.",
     )
+    hw.add_argument(
+        "--boot-disk-gb",
+        type=int,
+        default=100,
+        help="Boot disk size in GB (default: 100). Increase for large datasets with heavy temp spill.",
+    )
 
     args = parser.parse_args()
 
@@ -315,7 +324,10 @@ def main() -> None:
     output_dirs: dict[str, str] = {}
     job_names: list[str] = []
 
-    hw_desc = f"machine={machine_type or 'auto'}, gpu={args.gpu_type}, cpu={cpu_count}, memory={memory_gb}GB"
+    hw_desc = (
+        f"machine={machine_type or 'auto'}, gpu={args.gpu_type}, cpu={cpu_count}, "
+        f"memory={memory_gb}GB, boot_disk={args.boot_disk_gb}GB"
+    )
     print(f"Hardware: {hw_desc}", flush=True)
 
     for job_def in BENCHMARK_JOBS:
@@ -342,6 +354,7 @@ def main() -> None:
             gpu_type=args.gpu_type,
             cpu_count=cpu_count,
             memory_gb=memory_gb,
+            boot_disk_gib=args.boot_disk_gb,
         )
         job_names.append(job.name)
         print(f"  -> {job.name}", flush=True)
