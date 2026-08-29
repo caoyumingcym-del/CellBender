@@ -507,13 +507,18 @@ def _write_streaming_denoised_outputs(
         # background_fraction appended after the write (needs denoised totals)
     }
 
-    # For the filtered H5: latents cover cells only.
+    # For the filtered H5: latents cover cells only, sorted by ascending absolute
+    # barcode index so that each DuckDB batch spans a tight cell_id range and can
+    # skip the majority of parquet row groups (vs. near-full-table scans when
+    # cells are in UMI-count order with widely scattered absolute indices).
+    _cell_sort_perm = np.argsort(cell_inds)
+    _cell_inds_sorted = cell_inds[_cell_sort_perm]
     local_latents_filtered: Dict[str, Optional[np.ndarray]] = {
-        "barcode_indices_for_latents": analyzed_barcode_inds,
-        "gene_expression_encoding": latents["z"][analyzed_barcode_logic, :],
-        "cell_size": latents["d"][analyzed_barcode_logic],
-        "cell_probability": latents["p"][analyzed_barcode_logic],
-        "droplet_efficiency": latents["epsilon"][analyzed_barcode_logic],
+        "barcode_indices_for_latents": _cell_inds_sorted,
+        "gene_expression_encoding": latents["z"][analyzed_barcode_logic, :][_cell_sort_perm, :],
+        "cell_size": latents["d"][analyzed_barcode_logic][_cell_sort_perm],
+        "cell_probability": latents["p"][analyzed_barcode_logic][_cell_sort_perm],
+        "droplet_efficiency": latents["epsilon"][analyzed_barcode_logic][_cell_sort_perm],
         # background_fraction appended after the write
     }
 
@@ -561,19 +566,22 @@ def _write_streaming_denoised_outputs(
         logger.error(traceback.format_exc())
 
     # Step 4: Stream filtered H5 (cells only).
+    # barcodes and barcode_subset are in ascending absolute-index order so that
+    # each DuckDB range query spans a compact region of the sorted noise parquet.
     filtered_write_succeeded = False
     try:
         logger.info(f"Streaming denoised counts to {filtered_output_file}")
         denoised_per_bc_filt = stream_denoised_to_cellranger_h5(
             output_file=filtered_output_file,
-            barcodes=dataset_obj.data["barcodes"][cell_inds],
-            barcode_subset=cell_inds,
+            barcodes=dataset_obj.data["barcodes"][_cell_inds_sorted],
+            barcode_subset=_cell_inds_sorted,
             local_latents=local_latents_filtered,
             **shared_kwargs,
         )
         filtered_write_succeeded = True
         # Compute and append background_fraction for cells.
-        raw_counts_cells = raw_counts_analyzed[analyzed_barcode_logic]
+        # raw_counts_cells must match the sorted order used above.
+        raw_counts_cells = raw_counts_analyzed[analyzed_barcode_logic][_cell_sort_perm]
         out_cells = denoised_per_bc_filt.astype(np.float64)
         bg_frac_filt = (raw_counts_cells - out_cells) / (raw_counts_cells + 0.001)
         with _tables.open_file(filtered_output_file, "a") as f:
