@@ -4,3 +4,6 @@ workflows:
   - subclass: WDL
     primaryDescriptorPath: /wdl/cellbender_remove_background.wdl
     name: cellbender_remove_background
+  - subclass: WDL
+    primaryDescriptorPath: /wdl/cellbender_remove_background_seed.wdl
+    name: cellbender_remove_background_seed
