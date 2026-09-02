@@ -8,6 +8,7 @@ import sys
 import torch
 
 from cellbender.base_cli import AbstractCLI, get_version
+from cellbender.remove_background import consts
 from cellbender.remove_background.run import run_remove_background
 
 
@@ -226,6 +227,9 @@ def main(args) -> None:
     """Take command-line input, parse arguments, and run tests or tool."""
 
     args, file_handler = setup_and_logging(args)
+
+    if getattr(args, "random_seed", None) is not None:
+        consts.RANDOM_SEED = args.random_seed
 
     # Run the tool.
     run_remove_background(args)

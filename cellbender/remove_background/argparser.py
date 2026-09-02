@@ -404,5 +404,13 @@ def add_subparser_args(subparsers: argparse._SubParsersAction) -> argparse._SubP
         dest="truth_file",
         help="This is only used by developers for report generation.  Truth h5 file (for simulated data only).",
     )
+    subparser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        dest="random_seed",
+        help="Random seed for reproducibility.  Defaults to CellBender's built-in "
+             "constant seed if not specified.",
+    )
 
     return subparsers
