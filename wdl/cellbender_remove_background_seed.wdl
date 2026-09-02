@@ -15,11 +15,15 @@ workflow RunCellbender {
     String docker_image
     Array[String]? samples
     Array[String] modes = ["gex", "all"]
-    Int epochs = 35
+    # Each of these three sweeps independently: give one of them multiple
+    # values to test that parameter, and leave the other two at their
+    # single-value defaults so the run count stays just the sweep size
+    # (not a cross product of all three).
+    Array[Int] epochs = [35]
     Int expected_cells = 100000
     Int total_droplets_included = 200000
-    Float training_fraction = 0.9
-    Int? seed
+    Array[Float] training_fraction = [0.9]
+    Array[Int] seed = [1234]
     Int cpu = 16
     Int memory_gb = 64
     Int disk_gb = 100
@@ -32,37 +36,43 @@ workflow RunCellbender {
 
   scatter (sample in samples_to_run) {
     scatter (mode in modes) {
-      call RunCellbender {
-        input:
-          sample        = sample,
-          mode          = mode,
-          input_gcs_dir = input_gcs_dir,
-          docker_image  = docker_image,
-          epochs        = epochs,
-          expected_cells = expected_cells,
-          total_droplets_included = total_droplets_included,
-          training_fraction = training_fraction,
-          seed          = seed,
-          cpu           = cpu,
-          memory_gb     = memory_gb,
-          disk_gb       = disk_gb
+      scatter (epochs_ in epochs) {
+        scatter (seed_ in seed) {
+          scatter (training_fraction_ in training_fraction) {
+            call RunCellbender {
+              input:
+                sample        = sample,
+                mode          = mode,
+                input_gcs_dir = input_gcs_dir,
+                docker_image  = docker_image,
+                epochs        = epochs_,
+                expected_cells = expected_cells,
+                total_droplets_included = total_droplets_included,
+                training_fraction = training_fraction_,
+                seed          = seed_,
+                cpu           = cpu,
+                memory_gb     = memory_gb,
+                disk_gb       = disk_gb
+            }
+          }
+        }
       }
     }
 
     call OrganizeSample {
       input:
         sample                       = sample,
-        h5_files                     = RunCellbender.output_h5,
-        filtered_h5_files            = RunCellbender.filtered_h5,
-        pdfs                         = RunCellbender.pdf,
-        cell_barcodes_csvs           = RunCellbender.cell_barcodes_csv,
-        metrics_csvs                 = RunCellbender.metrics_csv,
-        posterior_parquets           = RunCellbender.posterior_parquet,
-        posterior_latents_csvs       = RunCellbender.posterior_latents_csv,
-        posterior_global_latents_jsons = RunCellbender.posterior_global_latents_json,
-        report_htmls                 = RunCellbender.report_html,
-        logs                         = RunCellbender.log,
-        reports                      = RunCellbender.resource_report,
+        h5_files                     = flatten(flatten(flatten(RunCellbender.output_h5))),
+        filtered_h5_files            = flatten(flatten(flatten(RunCellbender.filtered_h5))),
+        pdfs                         = flatten(flatten(flatten(RunCellbender.pdf))),
+        cell_barcodes_csvs           = flatten(flatten(flatten(RunCellbender.cell_barcodes_csv))),
+        metrics_csvs                 = flatten(flatten(flatten(RunCellbender.metrics_csv))),
+        posterior_parquets           = flatten(flatten(flatten(RunCellbender.posterior_parquet))),
+        posterior_latents_csvs       = flatten(flatten(flatten(RunCellbender.posterior_latents_csv))),
+        posterior_global_latents_jsons = flatten(flatten(flatten(RunCellbender.posterior_global_latents_json))),
+        report_htmls                 = flatten(flatten(flatten(RunCellbender.report_html))),
+        logs                         = flatten(flatten(flatten(RunCellbender.log))),
+        reports                      = flatten(flatten(flatten(RunCellbender.resource_report))),
         output_gcs_dir               = output_gcs_dir
     }
   }
@@ -105,13 +115,14 @@ task RunCellbender {
     Int expected_cells
     Int total_droplets_included
     Float training_fraction
-    Int? seed
+    Int seed
     Int cpu
     Int memory_gb
     Int disk_gb
   }
 
   File input_h5ad = input_gcs_dir + "/" + sample + "." + mode + ".h5ad"
+  String out_prefix = "~{sample}.~{mode}.e~{epochs}.s~{seed}.tf~{training_fraction}"
 
   command <<<
     set -euo pipefail
@@ -119,14 +130,14 @@ task RunCellbender {
 
     cellbender remove-background \
       --input ~{input_h5ad} \
-      --output ~{sample}.~{mode}.cellbender.h5 \
+      --output ~{out_prefix}.cellbender.h5 \
       --cpu-threads ~{cpu} \
       --epochs ~{epochs} \
       --expected-cells ~{expected_cells} \
       --total-droplets-included ~{total_droplets_included} \
       --training-fraction ~{training_fraction} \
-      ~{"--random-seed " + seed} \
-      > >(tee ~{sample}.~{mode}.log) 2>&1 &
+      --random-seed ~{seed} \
+      > >(tee ~{out_prefix}.log) 2>&1 &
     CB_PID=$!
 
     PEAK_KB=0
@@ -147,23 +158,23 @@ task RunCellbender {
       printf 'Elapsed (wall clock) time: %02d:%02d:%02d\n' \
         $((ELAPSED_SEC/3600)) $((ELAPSED_SEC%3600/60)) $((ELAPSED_SEC%60))
       echo "Maximum resident set size (kbytes): $PEAK_KB"
-    } > ~{sample}.~{mode}.resource_report.txt
+    } > ~{out_prefix}.resource_report.txt
 
     exit "$CB_EXIT"
   >>>
 
   output {
-    File output_h5 = "~{sample}.~{mode}.cellbender.h5"
-    File filtered_h5 = "~{sample}.~{mode}.cellbender_filtered.h5"
-    File pdf = "~{sample}.~{mode}.cellbender.pdf"
-    File cell_barcodes_csv = "~{sample}.~{mode}.cellbender_cell_barcodes.csv"
-    File metrics_csv = "~{sample}.~{mode}.cellbender_metrics.csv"
-    File posterior_parquet = "~{sample}.~{mode}.cellbender_posterior.parquet"
-    File posterior_latents_csv = "~{sample}.~{mode}.cellbender_posterior_latents.csv.gz"
-    File posterior_global_latents_json = "~{sample}.~{mode}.cellbender_posterior_global_latents.json"
-    File report_html = "~{sample}.~{mode}.cellbender_report.html"
-    File log = "~{sample}.~{mode}.log"
-    File resource_report = "~{sample}.~{mode}.resource_report.txt"
+    File output_h5 = "~{out_prefix}.cellbender.h5"
+    File filtered_h5 = "~{out_prefix}.cellbender_filtered.h5"
+    File pdf = "~{out_prefix}.cellbender.pdf"
+    File cell_barcodes_csv = "~{out_prefix}.cellbender_cell_barcodes.csv"
+    File metrics_csv = "~{out_prefix}.cellbender_metrics.csv"
+    File posterior_parquet = "~{out_prefix}.cellbender_posterior.parquet"
+    File posterior_latents_csv = "~{out_prefix}.cellbender_posterior_latents.csv.gz"
+    File posterior_global_latents_json = "~{out_prefix}.cellbender_posterior_global_latents.json"
+    File report_html = "~{out_prefix}.cellbender_report.html"
+    File log = "~{out_prefix}.log"
+    File resource_report = "~{out_prefix}.resource_report.txt"
   }
 
   runtime {
