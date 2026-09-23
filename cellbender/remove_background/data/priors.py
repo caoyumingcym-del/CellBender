@@ -83,6 +83,8 @@ def _peak_density_given_cutoff(
 
     # get the UMI count values we are including
     noncell_counts = umi_counts[umi_counts <= cutoff]
+    if len(noncell_counts) == 0:
+        raise ValueError(f"No droplets with UMI counts at or below cutoff {cutoff:.1f} to estimate empty droplet counts")
 
     # resample them: the magic of looking at a log log plot
     n_putative_cells = (umi_counts > cell_count_low_limit).sum()
@@ -334,10 +336,17 @@ def get_priors(
             f"typically too large. Recomputing with "
             f"low_count_threshold = {priors['empty_count_upper_limit']:.0f}"
         )
-        priors = get_cell_count_empty_count(
-            umi_counts=umi_counts,
-            low_count_threshold=priors["empty_count_upper_limit"],
-        )
+        try:
+            new_priors = get_cell_count_empty_count(
+                umi_counts=umi_counts,
+                low_count_threshold=priors["empty_count_upper_limit"],
+            )
+        except ValueError as e:
+            # Raising the threshold can push past every empty droplet (e.g. datasets with
+            # hundreds of thousands of cells), so keep the last estimate that worked.
+            logger.debug(f"Recomputing priors failed ({e}); keeping previous priors")
+            break
+        priors = new_priors
         priors.update(get_expected_cells_and_total_droplets(umi_counts=umi_counts, **priors))
         logger.debug(f"Automatically computed priors: {priors}")
         a += 1
